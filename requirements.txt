@@ -1,0 +1,6 @@
+aiogram>=3.4
+aiohttp
+icalendar
+python-dotenv
+requests
+beautifulsoup4
