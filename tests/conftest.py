@@ -5,7 +5,6 @@ from pathlib import Path
 os.environ.update(
     BOT_TOKEN="123456:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
     CHAT_ID="1",
-    ICAL_URL="https://example.invalid/feed.ics",
     DB_PATH=":memory:",
     MOODLE_TOKEN="",
     ECLASS_USERNAME="",
@@ -20,19 +19,14 @@ import bot as botmod  # noqa: E402
 
 @pytest.fixture
 def b(monkeypatch):
-    """bot module with a fresh in-memory DB and a recording send()."""
-    monkeypatch.setattr(botmod, "db", botmod.open_db(":memory:"))
+    """bot module with a recording send_message."""
     sent = []
 
-    async def fake_send(text):
+    async def fake_send(chat_id, text, **kw):
         sent.append(text)
 
-    monkeypatch.setattr(botmod, "send", fake_send)
-    botmod._fails.clear()
+    monkeypatch.setattr(botmod.bot, "send_message", fake_send)
+    botmod.db.execute("DELETE FROM events")
+    botmod.db.execute("DELETE FROM reminded")
     botmod.sent = sent
     return botmod
-
-
-@pytest.fixture
-def ics():
-    return (Path(__file__).parent / "sample.ics").read_bytes()

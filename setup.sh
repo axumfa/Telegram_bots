@@ -16,22 +16,20 @@ if [ ! -f .env ]; then
   read -r _
   CHAT_ID=$(curl -fsS "https://api.telegram.org/bot${TOKEN}/getUpdates" | python3 -c "
 import sys,json
-msgs=[u['message'] for u in json.load(sys.stdin)['result'] if 'message' in u]
-print(msgs[-1]['chat']['id'] if msgs else '')")
+r=json.load(sys.stdin)['result']
+print(r[-1]['message']['chat']['id'] if r else '')")
   [ -n "$CHAT_ID" ] || { echo "No message found. Send /start to the bot and rerun."; exit 1; }
   echo "Chat ID: $CHAT_ID"
 
-  read -rp "eclass calendar export URL (Calendar > Export > All courses): " ICAL
-  # (no early-closing pipe: with pipefail, head/grep -q make curl fail on big feeds)
-  [[ "$(curl -fsS "$ICAL" || true)" == *BEGIN:VCALENDAR* ]] && echo "  calendar OK" || { echo "  URL did not return a calendar"; exit 1; }
+  read -rp "eclass username: " EUSER
+  read -rsp "eclass password: " EPASS; echo
 
   cat > .env <<EOF
 BOT_TOKEN=${TOKEN}
 CHAT_ID=${CHAT_ID}
-ICAL_URL=${ICAL}
 MOODLE_TOKEN=
-ECLASS_USERNAME=
-ECLASS_PASSWORD=
+ECLASS_USERNAME=${EUSER}
+ECLASS_PASSWORD=${EPASS}
 POLL_MINUTES=20
 EOF
   chmod 600 .env
