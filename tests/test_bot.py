@@ -5,7 +5,17 @@ from pathlib import Path
 
 import pytest
 
-from bot import TZ, clean_title, parse_due, parse_grade_report, parse_overview, parse_status, short_course, week_end
+from bot import (
+    TZ,
+    clean_title,
+    parse_activity_grade,
+    parse_due,
+    parse_grade_report,
+    parse_overview,
+    parse_status,
+    short_course,
+    week_end,
+)
 
 COURSE = "Electronic Circuit[202602-ICE2080-001]"
 
@@ -246,3 +256,91 @@ async def test_grades_checked_every_third_poll(b, monkeypatch):
     with pytest.raises(asyncio.CancelledError):
         await b.poll_loop()
     assert calls == {"events": 7, "news": 7, "grades": 3}  # polls 1, 4 and 7
+
+
+# ---------- grades from assignment / quiz pages (courses that hide their gradebook) ----------
+def test_parse_activity_grade_real_pages():
+    assert parse_activity_grade("assign", fixture("assign_graded.html")) == ("63.00", "100.00")
+    assert parse_activity_grade("assign", fixture("assign_ungraded.html")) is None  # "Not graded"
+    assert parse_activity_grade("quiz", fixture("quiz_attempt.html")) == ("1.00", "1.00")
+
+
+def test_fixtures_hold_no_grader_name():
+    assert "Anon Grader" in fixture("assign_graded.html")  # the 'Graded by' name is scrubbed
+
+
+def quiz_page(*attempts):
+    rows = "".join(f"<tr><td>{state}</td><td>{grade}</td><td>Review</td></tr>" for state, grade in attempts)
+    return f'<table class="quizattemptsummary"><thead><tr><th>State</th><th>Grade / 10.00</th><th>Review</th></tr></thead><tbody>{rows}</tbody></table>'
+
+
+def test_parse_quiz_grade_takes_best_finished_attempt():
+    assert parse_activity_grade("quiz", quiz_page(("Finished", "4.50"), ("Finished", "7.25"), ("Finished", "6.00"))) == ("7.25", "10.00")
+    assert parse_activity_grade("quiz", quiz_page(("Finished", "3.00"), ("In progress", "-"))) == ("3.00", "10.00")
+    assert parse_activity_grade("quiz", quiz_page(("In progress", "-"))) is None
+    assert parse_activity_grade("quiz", "<p>No attempts yet</p>") is None
+
+
+def test_render_grades_without_course_total(b):
+    rows = [("Signals[001]", "HW 1", "63", "100", "63.00 %", "item"), ("Signals[001]", "HW 2", None, "100", None, "item")]
+    assert b.render_grades(rows, detail=False) == "📊 <b>Signals</b> · 1/2 graded"  # no 'total —' for a missing total
+    detail = b.render_grades(rows, detail=True)
+    assert "total" not in detail.split("\n")[0] and "✅ HW 1 · 63/100 (63.00%)" in detail
+    assert "no course total" in detail
+
+
+def _fake_eclass(monkeypatch, b, activity_error=None):
+    from types import SimpleNamespace
+
+    pages = {
+        "overview": "<table></table>",
+        "user/index.php?id=1": fixture("grades_os.html"),  # gradebook visible
+        "user/index.php?id=2": fixture("grades_hidden.html"),  # "Can not view grades."
+        "act/a1": fixture("assign_graded.html"),
+        "act/a2": fixture("assign_ungraded.html"),
+        "act/q1": fixture("quiz_attempt.html"),
+    }
+
+    def web_get(url, **kw):
+        if activity_error and url.endswith(activity_error):
+            raise ValueError("boom")
+        return SimpleNamespace(text=next(v for k, v in pages.items() if k in url))
+
+    monkeypatch.setattr(b, "web_get", web_get)
+    monkeypatch.setattr(b, "list_courses", lambda: {"1": "Visible", "2": "Hidden"})
+    monkeypatch.setattr(
+        b, "course_activities",
+        lambda cid, fb: ("Hidden[001]", [("assign", "1", "HW 1 (Assignment closes)", "act/a1"), ("assign", "2", "HW 2", "act/a2"), ("quiz", "3", "Quiz 1", "act/q1")], []),
+    )
+
+
+def test_scrape_grades_reads_activity_pages_for_hidden_gradebook(b, monkeypatch):
+    _fake_eclass(monkeypatch, b)
+    out = b.scrape_grades()
+    assert set(out) == {"1", "2"}
+    assert any(r[4] == "total" for r in out["1"][1])  # visible gradebook: unchanged
+    name, rows = out["2"]
+    assert name == "Hidden[001]"
+    assert rows == [
+        ("HW 1", "63.00", "100.00", "63.00 %", "item"),
+        ("HW 2", None, None, None, "item"),
+        ("Quiz 1", "1.00", "1.00", "100.00 %", "item"),
+    ]
+
+
+def test_scrape_grades_skips_whole_course_if_one_activity_fails(b, monkeypatch):
+    _fake_eclass(monkeypatch, b, activity_error="a2")
+    out = b.scrape_grades()
+    assert set(out) == {"1"}  # a half-read course would later alert already-known grades as new
+
+
+async def test_hidden_course_grade_alert_end_to_end(b, monkeypatch):
+    monkeypatch.setattr(b, "ECLASS_USERNAME", "u")
+    monkeypatch.setattr(b, "ECLASS_PASSWORD", "p")
+    state = {"2": ("Hidden[001]", [("HW 1", None, None, None, "item"), ("HW 2", "5", "10", "50.00 %", "item")])}
+    monkeypatch.setattr(b, "scrape_grades", lambda: state)
+    await b.sync_grades()
+    assert b.sent == []
+    state["2"] = ("Hidden[001]", [("HW 1", "9", "10", "90.00 %", "item"), ("HW 2", "5", "10", "50.00 %", "item")])
+    await b.sync_grades()
+    assert len(b.sent) == 1 and "HW 1" in b.sent[0] and "9/10 (90.00%)" in b.sent[0] and "HW 2" not in b.sent[0]

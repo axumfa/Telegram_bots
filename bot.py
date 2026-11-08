@@ -314,11 +314,47 @@ def parse_overview(page):
     return out
 
 
+def parse_activity_grade(kind, page):
+    """(grade, max) from an assignment or quiz view page, or None while it isn't graded.
+
+    Courses that hide their gradebook still show the grade on the activity itself.
+    """
+    soup = BeautifulSoup(page, "html.parser")
+    if kind == "assign":
+        for tr in soup.select(".feedbacktable tr"):
+            cells = tr.find_all(["th", "td"])
+            if len(cells) == 2 and re.fullmatch(r"grade", cells[0].get_text(strip=True), re.I):
+                m = re.search(r"([\d.,]+)\s*/\s*([\d.,]+)", cells[1].get_text(" ").replace("\xa0", " "))
+                return (m.group(1), m.group(2)) if m else None
+        return None
+    table = soup.select_one("table.quizattemptsummary")
+    head = [th.get_text(" ", strip=True) for th in table.select("thead th")] if table else []
+    col = next((i for i, h in enumerate(head) if re.search(r"grade", h, re.I)), None)
+    mx = col is not None and re.search(r"/\s*([\d.,]+)", head[col])
+    if not mx:
+        return None
+    best = None  # the best finished attempt
+    for tr in table.select("tbody tr"):
+        cells = [c.get_text(" ", strip=True) for c in tr.find_all(["td", "th"])]
+        if col < len(cells) and re.fullmatch(r"[\d.,]+", cells[col]):
+            if best is None or float(cells[col].replace(",", ".")) > float(best.replace(",", ".")):
+                best = cells[col]
+    return (best, mx.group(1)) if best else None
+
+
+def _pct(grade, mx):
+    try:
+        return f"{float(grade.replace(',', '.')) / float(mx.replace(',', '.')) * 100:.2f} %"
+    except (ValueError, ZeroDivisionError, AttributeError):
+        return None
+
+
 def scrape_grades():
     """{course id: (course name, [(item, grade, max, pct, kind)])}. Blocking.
 
-    Uses each course's grade report where eclass lets students see it; for courses that hide it,
-    falls back to just the course total from the overview report. One failure doesn't stop the rest.
+    Uses each course's grade report where eclass lets students see it. For courses that hide it, reads the
+    grade from each assignment/quiz page instead (no course total then); a course with neither only gets its
+    total from the overview report, if listed. One failing course doesn't stop the rest.
     """
     try:
         overview = parse_overview(web_get(f"{MOODLE_URL}/grade/report/overview/index.php").text)
@@ -335,9 +371,17 @@ def scrape_grades():
             if rows is not None:
                 h1 = BeautifulSoup(page, "html.parser").find("h1")
                 out[cid] = (h1.get_text(" ", strip=True) if h1 else fallback, rows)
-            elif cid in overview:
-                name, total = overview[cid]
-                out[cid] = (name, [("Course total", total, None, None, "total")])
+            else:
+                name, acts, _ = course_activities(cid, fallback)
+                items = []
+                for kind, mid, title, url in acts:  # a failure here skips the course, keeping its old rows
+                    got = parse_activity_grade(kind, web_get(url).text)
+                    items.append((clean_title(title), *(got or (None, None)), got and _pct(*got), "item"))
+                if items:
+                    out[cid] = (name, items)
+                elif cid in overview:
+                    name, total = overview[cid]
+                    out[cid] = (name, [("Course total", total, None, None, "total")])
         except Exception as e:
             if isinstance(e, RuntimeError):
                 raise
@@ -563,17 +607,19 @@ def render_grades(rows, detail):
         parts = [r for r in items if r[5] == "item"]
         graded = [r for r in parts if r[2] is not None]
         head = f"<b>{esc(short_course(course))}</b>"
-        total_txt = esc(grade_text(*total[2:5])) if total else "—"
+        total_txt = f" · total {esc(grade_text(*total[2:5]))}" if total else ""  # hidden gradebooks have no total
         if not detail:
             tail = f" · {len(graded)}/{len(parts)} graded" if parts else ""
-            out.append(f"📊 {head} · total {total_txt}{tail}")
+            out.append(f"📊 {head}{total_txt}{tail}")
             continue
-        out.append(("\n" if out else "") + f"{head} · total {total_txt}")
+        out.append(("\n" if out else "") + f"{head}{total_txt}")
         out += [f"✅ {esc(r[1])} · {esc(grade_text(*r[2:5]))}" for r in graded]
         if len(parts) > len(graded):
             out.append(f"⏳ {len(parts) - len(graded)} not graded yet")
         if not parts:
             out.append("<i>this course hides its grade details on eclass</i>")
+        elif not total:
+            out.append("<i>eclass shows no course total here; grades are read from the assignments and quizzes</i>")
     return "\n".join(out)
 
 
