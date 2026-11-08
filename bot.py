@@ -26,10 +26,17 @@ MOODLE_TOKEN = os.getenv("MOODLE_TOKEN", "")  # optional: enables announcements
 ECLASS_USERNAME = os.getenv("ECLASS_USERNAME", "")
 ECLASS_PASSWORD = os.getenv("ECLASS_PASSWORD", "")
 POLL_MINUTES = int(os.getenv("POLL_MINUTES", "20"))
+GRADES_EVERY = 3  # check grades on every 3rd poll
 TZ = ZoneInfo("Asia/Tashkent")
 UA = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:130.0) Gecko/20100101 Firefox/130.0"}
 # smallest first
-REMINDERS = [("3h", timedelta(hours=3)), ("1d", timedelta(days=1)), ("3d", timedelta(days=3))]
+REMINDERS = [
+    ("1h", timedelta(hours=1)),
+    ("6h", timedelta(hours=6)),
+    ("1d", timedelta(days=1)),
+    ("3d", timedelta(days=3)),
+    ("7d", timedelta(days=7)),
+]
 DATE_RE = r"(\d{4}-\d{2}-\d{2} \d{2}:\d{2})"
 ICON = {"done": "✅", "todo": "❌", "na": "📌", "?": "❔"}
 RES_ICON = {"ubfile": "📄", "vod": "🎥", "folder": "📁", "url": "🔗", "page": "📝"}  # course items that need no submission
@@ -46,6 +53,7 @@ db.executescript(
     CREATE TABLE IF NOT EXISTS reminded(uid TEXT, label TEXT, PRIMARY KEY(uid, label));
     CREATE TABLE IF NOT EXISTS news(id TEXT PRIMARY KEY);
     CREATE TABLE IF NOT EXISTS resources(uid TEXT PRIMARY KEY, title TEXT, course TEXT, kind TEXT, url TEXT, first_seen INTEGER);
+    CREATE TABLE IF NOT EXISTS grades(uid TEXT PRIMARY KEY, course TEXT, item TEXT, grade TEXT, max TEXT, pct TEXT, kind TEXT, updated INTEGER);
     """
 )
 for col in ("url", "kind", "status"):  # added later; migrate old databases
@@ -262,6 +270,81 @@ def scrape_courses(known):
     return out, resources
 
 
+def _grade_value(s):
+    s = " ".join((s or "").split())
+    return None if s in ("", "-") else s
+
+
+def parse_grade_report(page):
+    """[(item, grade, max, pct, kind)] from a Moodle 'User report' page, kind 'item' or 'total' (the course total).
+
+    None if the course hides grades from students. Ungraded items have grade None; category sub-totals are skipped.
+    """
+    table = BeautifulSoup(page, "html.parser").select_one("table.user-grade")
+    if not table:
+        return None
+    out = []
+    for tr in table.select("tbody tr"):
+        head, grade = tr.select_one("th.column-itemname"), tr.select_one("td.column-grade")
+        if not (head and grade):
+            continue  # category heading row
+        classes = head.get("class", [])
+        if "baggt" in classes:
+            if "level1" not in classes:
+                continue  # category sub-total
+            kind, name = "total", "Course total"
+        else:
+            kind, name = "item", re.sub(r"\s*Include empty grades\.?\s*$", "", head.get_text(" ", strip=True))
+        rng = tr.select_one("td.column-range")
+        mx = re.search(r"[–-]\s*([\d.,]+)\s*$", rng.get_text(strip=True)) if rng else None
+        pct = tr.select_one("td.column-percentage")
+        out.append((name, _grade_value(grade.get_text()), mx and mx.group(1), _grade_value(pct and pct.get_text()), kind))
+    return out
+
+
+def parse_overview(page):
+    """{course id: (course name, total or None)} from the cross-course 'Grades overview' report."""
+    out = {}
+    for tr in BeautifulSoup(page, "html.parser").select("table.generaltable tbody tr"):
+        cells = tr.find_all(["th", "td"])
+        a = tr.select_one("a[href*='id=']")
+        m = a and re.search(r"[?&]id=(\d+)", a["href"])
+        if m and len(cells) >= 2:
+            out[m.group(1)] = (a.get_text(" ", strip=True), _grade_value(cells[-1].get_text()))
+    return out
+
+
+def scrape_grades():
+    """{course id: (course name, [(item, grade, max, pct, kind)])}. Blocking.
+
+    Uses each course's grade report where eclass lets students see it; for courses that hide it,
+    falls back to just the course total from the overview report. One failure doesn't stop the rest.
+    """
+    try:
+        overview = parse_overview(web_get(f"{MOODLE_URL}/grade/report/overview/index.php").text)
+    except Exception as e:
+        if isinstance(e, RuntimeError):
+            raise
+        log.warning("grades overview failed: %s", e)
+        overview = {}
+    out = {}
+    for cid, fallback in list_courses().items():
+        try:
+            page = web_get(f"{MOODLE_URL}/grade/report/user/index.php?id={cid}").text
+            rows = parse_grade_report(page)
+            if rows is not None:
+                h1 = BeautifulSoup(page, "html.parser").find("h1")
+                out[cid] = (h1.get_text(" ", strip=True) if h1 else fallback, rows)
+            elif cid in overview:
+                name, total = overview[cid]
+                out[cid] = (name, [("Course total", total, None, None, "total")])
+        except Exception as e:
+            if isinstance(e, RuntimeError):
+                raise
+            log.warning("grades of course %s failed: %s", cid, e)
+    return out
+
+
 # ---------- sync jobs ----------
 _login_alerted = False
 
@@ -387,9 +470,47 @@ async def sync_news():
     db.commit()
 
 
+def grade_text(grade, mx, pct):
+    """'85/100 (85.00%)', '85', or '—' when not graded."""
+    if grade is None:
+        return "—"
+    out = f"{grade}/{mx}" if mx else grade
+    return f"{out} ({pct.replace(' ', '')})" if pct else out
+
+
+async def sync_grades():
+    """Pull grades from eclass; alert on new and changed ones (the first run only records them)."""
+    if not (ECLASS_USERNAME and ECLASS_PASSWORD):
+        raise RuntimeError("ECLASS_USERNAME / ECLASS_PASSWORD not set")
+    first_run = db.execute("SELECT COUNT(*) FROM grades").fetchone()[0] == 0
+    old = {uid: grade for uid, grade in db.execute("SELECT uid,grade FROM grades")}
+    found = await asyncio.to_thread(scrape_grades)
+    now = int(datetime.now(timezone.utc).timestamp())
+    alerts = []
+    for cid, (course, rows) in found.items():
+        db.execute("DELETE FROM grades WHERE uid LIKE ?", (f"{cid}:%",))
+        # a total only gets its own alert when the course hides its items
+        has_items = any(r[4] == "item" for r in rows)
+        seen = {}
+        for item, grade, mx, pct, kind in rows:
+            n = seen[(kind, item)] = seen.get((kind, item), 0) + 1
+            uid = f"{cid}:{kind}:{item}" + (f"#{n}" if n > 1 else "")
+            db.execute("INSERT INTO grades VALUES(?,?,?,?,?,?,?,?)", (uid, course, item, grade, mx, pct, kind, now))
+            if first_run or grade is None or old.get(uid) == grade or (kind == "total" and has_items):
+                continue
+            was = f" (was {esc(old[uid])})" if old.get(uid) is not None else ""
+            alerts.append(f"• <b>{esc(item)}</b> · {esc(short_course(course))} · {esc(grade_text(grade, mx, pct))}{was}")
+    db.commit()
+    for i in range(0, len(alerts), 25):  # stay under Telegram's message size limit
+        await bot.send_message(CHAT_ID, "📊 <b>New grades</b>\n\n" + "\n".join(alerts[i : i + 25]))
+
+
 async def poll_loop():
+    polls = 0
     while True:
-        for job in (sync_events, sync_news):
+        jobs = [sync_events, sync_news] + ([sync_grades] if polls % GRADES_EVERY == 0 else [])
+        polls += 1
+        for job in jobs:
             try:
                 await job()
             except Exception:
@@ -407,12 +528,21 @@ async def reminder_loop():
 
 
 # ---------- commands ----------
-def upcoming(days=None, limit=15, hide_done=False):
+def week_end(now):
+    """Start of the Monday after the first Sunday on or after now+7d, so next weekend is always in range."""
+    d = datetime.fromtimestamp(now, TZ).date() + timedelta(days=7)
+    d += timedelta(days=(6 - d.weekday()) % 7 + 1)
+    return datetime(d.year, d.month, d.day, tzinfo=TZ).timestamp()
+
+
+def upcoming(days=None, limit=15, hide_done=False, until=None):
     now = datetime.now(timezone.utc).timestamp()
     q, args = f"SELECT {COLS} FROM events WHERE start_ts > ?", [now]
     if days is not None:
+        until = now + days * 86400
+    if until is not None:
         q += " AND start_ts < ?"
-        args.append(now + days * 86400)
+        args.append(until)
     if hide_done:
         q += " AND COALESCE(status,'') != 'done'"
     return db.execute(q + " ORDER BY start_ts LIMIT ?", args + [limit]).fetchall()
@@ -422,18 +552,44 @@ async def reply_list(m: Message, rows, empty):
     await m.answer(render(rows) if rows else empty)
 
 
+def render_grades(rows, detail):
+    """rows: (course, item, grade, max, pct, kind). Course totals one per line, or (detail) each course's graded items."""
+    courses = {}
+    for r in rows:
+        courses.setdefault(r[0], []).append(r)
+    out = []
+    for course, items in sorted(courses.items()):
+        total = next((r for r in items if r[5] == "total"), None)
+        parts = [r for r in items if r[5] == "item"]
+        graded = [r for r in parts if r[2] is not None]
+        head = f"<b>{esc(short_course(course))}</b>"
+        total_txt = esc(grade_text(*total[2:5])) if total else "—"
+        if not detail:
+            tail = f" · {len(graded)}/{len(parts)} graded" if parts else ""
+            out.append(f"📊 {head} · total {total_txt}{tail}")
+            continue
+        out.append(("\n" if out else "") + f"{head} · total {total_txt}")
+        out += [f"✅ {esc(r[1])} · {esc(grade_text(*r[2:5]))}" for r in graded]
+        if len(parts) > len(graded):
+            out.append(f"⏳ {len(parts) - len(graded)} not graded yet")
+        if not parts:
+            out.append("<i>this course hides its grade details on eclass</i>")
+    return "\n".join(out)
+
+
 MENU = [
     ("upcoming", "Next 15 deadlines"),
     ("today", "Due in the next 24 hours"),
-    ("week", "Due in the next 7 days"),
+    ("week", "Due until the end of next Sunday"),
     ("resources", "Latest course materials"),
+    ("grades", "Your grades"),
     ("sync", "Refresh from eclass now"),
     ("help", "What this bot does"),
 ]
 KEYBOARD = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="/upcoming"), KeyboardButton(text="/today"), KeyboardButton(text="/week")],
-        [KeyboardButton(text="/resources"), KeyboardButton(text="/sync"), KeyboardButton(text="/help")],
+        [KeyboardButton(text="/resources"), KeyboardButton(text="/grades"), KeyboardButton(text="/sync"), KeyboardButton(text="/help")],
     ],
     resize_keyboard=True,
     is_persistent=True,
@@ -444,17 +600,19 @@ HELP = (
     "<b>Commands</b>\n"
     "/upcoming — next 15 deadlines\n"
     "/today — due in the next 24 hours\n"
-    "/week — due in the next 7 days\n"
+    "/week — due until the end of next Sunday (so next weekend is included)\n"
     "/resources — latest course materials (files, videos, links). "
     "Add a word to filter: <code>/resources database</code>\n"
+    "/grades — your course totals. Add a word for the details of one course: <code>/grades database</code>\n"
     "/sync — check eclass right now\n\n"
     "<b>Icons</b>\n"
     "❌ not submitted yet · ✅ submitted · ❔ can't tell (e.g. submitted elsewhere)\n"
     "📄 file · 🎥 video · 📁 folder · 🔗 link · 📝 page\n\n"
     "<b>Automatic messages</b>\n"
     "🆕 new deadline · ⚠️ deadline moved\n"
-    "⏰ reminder 3 days, 1 day and 3 hours before a deadline (not for submitted work)\n"
+    "⏰ reminder 7 days, 3 days, 1 day, 6 hours and 1 hour before a deadline (not for submitted work)\n"
     "📚 new course material\n"
+    "📊 new or changed grade (checked every third refresh)\n"
     "Tap a title to open it on eclass."
 )
 
@@ -476,7 +634,8 @@ async def cmd_today(m: Message):
 
 @dp.message(Command("week"))
 async def cmd_week(m: Message):
-    await reply_list(m, upcoming(7, hide_done=True), "Nothing due this week 🎉")
+    now = datetime.now(timezone.utc).timestamp()
+    await reply_list(m, upcoming(until=week_end(now), limit=30, hide_done=True), "Nothing due this week 🎉")
 
 
 @dp.message(Command("resources"))
@@ -492,11 +651,32 @@ async def cmd_resources(m: Message, command: CommandObject):
     await m.answer(render_resources(rows) if rows else "No materials found")
 
 
+@dp.message(Command("grades"))
+async def cmd_grades(m: Message, command: CommandObject):
+    """Course totals; '/grades database' shows the graded items of matching courses."""
+    q, args = "SELECT course,item,grade,max,pct,kind FROM grades", []
+    if command.args:
+        q += " WHERE course LIKE ?"
+        args = [f"%{command.args.strip()}%"]
+    rows = db.execute(q, args).fetchall()
+    if not rows:
+        await m.answer("No grades found — try /sync first" if not command.args else "No course matches that")
+        return
+    chunk = ""
+    for ln in render_grades(rows, detail=bool(command.args)).split("\n"):
+        if chunk and len(chunk) + len(ln) > 3500:  # Telegram's limit is 4096; split on lines so tags stay whole
+            await m.answer(chunk)
+            chunk = ""
+        chunk += ("\n" if chunk else "") + ln
+    await m.answer(chunk)
+
+
 @dp.message(Command("sync"))
 async def cmd_sync(m: Message):
     try:
         await sync_events()
         await sync_news()
+        await sync_grades()
         await m.answer("Synced ✅")
     except Exception as e:
         await m.answer(f"Sync failed: {esc(e)}")

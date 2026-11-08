@@ -6,8 +6,9 @@ Telegram bot that tracks deadlines from eclass.inha.ac.kr (Moodle). Single file:
 
 - Logs in to eclass like a browser and reads every course page you're enrolled in every `POLL_MINUTES` (default 20): assignments and quizzes with their **deadline** and whether each is **submitted**. Alerts on **new** and **moved** deadlines.
   ✅ submitted · ❌ not yet · ❔ couldn't tell (e.g. "submit on Gradescope"). Submitted items get no reminders and are hidden from `/today` and `/week`.
-- **Reminders** 3 days, 1 day and 3 hours before each deadline, once each. Items due together arrive as one message.
+- **Reminders** 7 days, 3 days, 1 day, 6 hours and 1 hour before each deadline, once each. Items due together arrive as one message.
 - **Course materials** (files, lecture videos, folders, links, pages — anything without a submission): new ones are announced as 📚 *New material*, grouped by course. `/resources` lists the latest 15; `/resources database` filters by course or title. The first run only records what's already there.
+- **Grades**: `/grades` shows every course's total; `/grades database` shows the graded items of matching courses. Every third refresh (about hourly) the grade reports are re-read and a 📊 message arrives when a grade appears or changes (the first run only records them). Courses that hide their grade report from students on eclass (they answer "Can not view grades") can't be shown; if such a course also appears in eclass's grades overview, its total is used.
 - With `MOODLE_TOKEN`: new course announcements from the news forums.
 
 Message format: `❌ Homework 04 · Electronic Circuit · 23:59 · 1d 10h` (the title links to the activity).
@@ -22,7 +23,7 @@ Quote the password in `.env` if it contains spaces or `#`. `.env` is mode 600 an
 
 ## Commands
 
-`/upcoming` next 15 · `/today` next 24 h · `/week` next 7 days · `/resources [course]` latest materials · `/sync` refresh now · `/help` explains everything (also shown by `/start`, with tap-able buttons; the same list is in Telegram's command menu)
+`/upcoming` next 15 · `/today` next 24 h · `/week` until the end of next Sunday (≥ 7 days, so next weekend is always included) · `/resources [course]` latest materials · `/grades [course]` your grades · `/sync` refresh now · `/help` explains everything (also shown by `/start`, with tap-able buttons; the same list is in Telegram's command menu)
 
 Only the chat id in `.env` is answered.
 
@@ -32,3 +33,5 @@ Only the chat id in `.env` is answered.
 .venv/bin/pip install -r requirements-dev.txt
 .venv/bin/python -m pytest
 ```
+
+The grade-parser tests use real eclass pages in `tests/fixtures/` with the name, student id and `sesskey` removed. Raw captures named `grades_sample_*.html` are gitignored; never commit them.

@@ -28,5 +28,6 @@ def b(monkeypatch):
     monkeypatch.setattr(botmod.bot, "send_message", fake_send)
     botmod.db.execute("DELETE FROM events")
     botmod.db.execute("DELETE FROM reminded")
+    botmod.db.execute("DELETE FROM grades")
     botmod.sent = sent
     return botmod

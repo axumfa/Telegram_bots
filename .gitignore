@@ -3,3 +3,7 @@ eclass.db
 .venv/
 __pycache__/
 .pytest_cache/
+
+# unscrubbed grade pages (contain name / student id / sesskey)
+grades_sample_*.html
+!tests/fixtures/grades_*.html

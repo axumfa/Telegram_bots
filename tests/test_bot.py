@@ -1,7 +1,11 @@
+import asyncio
 import time
 from datetime import datetime
+from pathlib import Path
 
-from bot import TZ, clean_title, parse_due, parse_status, short_course
+import pytest
+
+from bot import TZ, clean_title, parse_due, parse_grade_report, parse_overview, parse_status, short_course, week_end
 
 COURSE = "Electronic Circuit[202602-ICE2080-001]"
 
@@ -55,7 +59,7 @@ def test_line_shows_status_and_link(b):
 
 
 async def test_reminders_batched_and_skip_done(b):
-    ts = int(time.time()) + 3600
+    ts = int(time.time()) + 1800
     for i, st in enumerate(["todo", "todo", "done"]):
         b.db.execute(
             "INSERT INTO events(uid,title,course,start_ts,status) VALUES(?,?,?,?,?)",
@@ -77,6 +81,168 @@ async def test_new_resources_announced_once(b, monkeypatch):
 
 def test_menu_matches_handlers(b):
     cmds = {c for c, _ in b.MENU}
-    assert cmds == {"upcoming", "today", "week", "resources", "sync", "help"}
+    assert cmds == {"upcoming", "today", "week", "resources", "grades", "sync", "help"}
     assert all(len(d) <= 256 for _, d in b.MENU)
     assert "<course>" not in b.HELP  # raw angle brackets would break Telegram's HTML parsing
+
+
+@pytest.mark.parametrize(
+    "now, end",
+    [
+        ("2026-10-17 12:00", "2026-10-26 00:00"),  # Saturday -> end of Sun 25th
+        ("2026-10-18 12:00", "2026-10-26 00:00"),  # Sunday -> end of the Sunday 7 days later
+        ("2026-10-21 12:00", "2026-11-02 00:00"),  # Wednesday -> end of Sun 1 Nov
+    ],
+)
+def test_week_end(now, end):
+    ts = datetime.strptime(now, "%Y-%m-%d %H:%M").replace(tzinfo=TZ).timestamp()
+    assert datetime.fromtimestamp(week_end(ts), TZ).strftime("%Y-%m-%d %H:%M") == end
+
+
+def test_week_includes_next_weekend(b):
+    now = time.time()
+    for uid, off in [("in", 7 * 86400 + 3600), ("out", 40 * 86400)]:
+        b.db.execute("INSERT INTO events(uid,title,course,start_ts,status) VALUES(?,?,?,?,?)", (uid, uid, COURSE, now + off, "todo"))
+    # whatever weekday the test runs on, a deadline 7d 1h away is inside the window
+    assert [r[0] for r in b.upcoming(until=b.week_end(now), hide_done=True)] == ["in"]
+
+
+async def test_reminder_labels(b):
+    now = time.time()
+    for uid, off in [("six_days", 6 * 86400), ("five_hours", 5 * 3600)]:
+        b.db.execute("INSERT INTO events(uid,title,course,start_ts,status) VALUES(?,?,?,?,?)", (uid, uid, COURSE, now + off, "todo"))
+    await b.check_reminders()
+    assert any("Due in 7d" in m and "six_days" in m for m in b.sent)
+    assert any("Due in 6h" in m and "five_hours" in m for m in b.sent)
+    b.sent.clear()
+    await b.check_reminders()
+    assert b.sent == []  # nothing repeats
+
+
+# ---------- grades ----------
+FIX = Path(__file__).parent / "fixtures"  # real eclass pages with name, id and sesskey scrubbed
+
+
+def fixture(name):
+    return (FIX / name).read_text(encoding="utf-8")
+
+
+def test_parse_grade_report_real_page():
+    rows = parse_grade_report(fixture("grades_os.html"))
+    items = [r for r in rows if r[4] == "item"]
+    totals = [r for r in rows if r[4] == "total"]
+    assert not any("SUM" in r[0] or "Include empty" in r[0] for r in rows)  # category sub-totals are skipped
+    assert len(totals) == 1 and totals[0][:4] == ("Course total", None, "100", None)
+    graded = {r[0]: r[1:4] for r in items if r[1] is not None}
+    assert graded == {
+        "Offline Attendance": ("26.00", "26", "100.00 %"),
+        "Attendance (10%)": ("10.00", "10", "100.00 %"),
+        "[SOC3010-001] Quiz 2 (1%)": ("100.00", "100", "100.00 %"),
+        "[SOC3010-001] Quiz 3 (1%)": ("100.00", "100", "100.00 %"),
+    }
+    assert ("[SOC3010-001] Quiz 1 (1%)", None, "100", None, "item") in rows  # '-' means not graded
+
+
+def test_parse_grade_report_hidden():
+    assert parse_grade_report(fixture("grades_hidden.html")) is None  # "Can not view grades."
+
+
+def test_parse_overview_real_page():
+    ov = parse_overview(fixture("grades_overview.html"))
+    assert len(ov) == 14  # the other 16 table rows are empty padding
+    assert ov["2603"] == ("Operating System", None)
+    assert ov["1907"] == ("Calculus 2", "886.92")
+
+
+def test_grade_text(b):
+    assert b.grade_text("85", "100", "85.00 %") == "85/100 (85.00%)"
+    assert b.grade_text("85", None, None) == "85"
+    assert b.grade_text(None, "100", None) == "—"
+
+
+def test_render_grades(b):
+    rows = [
+        (COURSE, "Course total", "50", "100", "50.00 %", "total"),
+        (COURSE, "Quiz 1 <b>", "5", "10", "50.00 %", "item"),
+        (COURSE, "Quiz 2", None, "10", None, "item"),
+        ("Hidden[001]", "Course total", None, None, None, "total"),
+    ]
+    short = b.render_grades(rows, detail=False)
+    assert "Electronic Circuit</b> · total 50/100 (50.00%) · 1/2 graded" in short
+    assert "Hidden</b> · total —" in short
+    detail = b.render_grades(rows[:3], detail=True)
+    assert "✅ Quiz 1 &lt;b&gt; · 5/10 (50.00%)" in detail  # escaped
+    assert "⏳ 1 not graded yet" in detail and "Quiz 2" not in detail
+
+
+def _scrape(monkeypatch, b, rows):
+    monkeypatch.setattr(b, "ECLASS_USERNAME", "u")
+    monkeypatch.setattr(b, "ECLASS_PASSWORD", "p")
+    monkeypatch.setattr(b, "scrape_grades", lambda: {"1": (COURSE, rows), "2": ("Hidden[001]", [("Course total", None, None, None, "total")])})
+
+
+def items(*grades):
+    return [(f"Quiz {i}", g, "10", None, "item") for i, g in enumerate(grades, 1)] + [("Course total", None, "100", None, "total")]
+
+
+async def test_first_grade_sync_is_silent_then_new_and_changed_alert_once(b, monkeypatch):
+    _scrape(monkeypatch, b, items("5", None))
+    await b.sync_grades()
+    assert b.sent == []  # first run only records what's there
+
+    _scrape(monkeypatch, b, items("5", "7"))  # Quiz 2 newly graded
+    await b.sync_grades()
+    assert len(b.sent) == 1 and "Quiz 2" in b.sent[0] and "Quiz 1" not in b.sent[0] and "7/10" in b.sent[0]
+
+    await b.sync_grades()
+    assert len(b.sent) == 1  # same grades again: nothing
+
+    _scrape(monkeypatch, b, items("6", "7"))  # Quiz 1 corrected
+    await b.sync_grades()
+    assert len(b.sent) == 2 and "Quiz 1" in b.sent[1] and "(was 5)" in b.sent[1]
+
+
+async def test_total_alert_only_when_course_hides_items(b, monkeypatch):
+    monkeypatch.setattr(b, "ECLASS_USERNAME", "u")
+    monkeypatch.setattr(b, "ECLASS_PASSWORD", "p")
+    state = {"1": ("Shown[001]", [("Quiz 1", None, "10", None, "item"), ("Course total", None, "100", None, "total")]),
+             "2": ("Hidden[001]", [("Course total", None, None, None, "total")])}
+    monkeypatch.setattr(b, "scrape_grades", lambda: state)
+    await b.sync_grades()  # first run
+    state["1"] = ("Shown[001]", [("Quiz 1", None, "10", None, "item"), ("Course total", "40", "100", None, "total")])
+    state["2"] = ("Hidden[001]", [("Course total", "88.5", None, None, "total")])
+    await b.sync_grades()
+    assert len(b.sent) == 1
+    assert "Hidden" in b.sent[0] and "88.5" in b.sent[0] and "Shown" not in b.sent[0]
+
+
+async def test_failed_course_keeps_old_grades(b, monkeypatch):
+    _scrape(monkeypatch, b, items("5", None))
+    await b.sync_grades()
+    monkeypatch.setattr(b, "scrape_grades", lambda: {})  # every course failed this time
+    await b.sync_grades()
+    assert b.db.execute("SELECT COUNT(*) FROM grades WHERE uid LIKE '1:%'").fetchone()[0] == 3
+
+
+async def test_grades_checked_every_third_poll(b, monkeypatch):
+    calls = {"events": 0, "news": 0, "grades": 0}
+
+    def counter(name):
+        async def job():
+            calls[name] += 1
+        job.__name__ = f"sync_{name}"
+        return job
+
+    for name in calls:
+        monkeypatch.setattr(b, f"sync_{name}", counter(name))
+    sleeps = []
+
+    async def fake_sleep(secs):
+        sleeps.append(secs)
+        if len(sleeps) == 7:
+            raise asyncio.CancelledError
+
+    monkeypatch.setattr(b.asyncio, "sleep", fake_sleep)
+    with pytest.raises(asyncio.CancelledError):
+        await b.poll_loop()
+    assert calls == {"events": 7, "news": 7, "grades": 3}  # polls 1, 4 and 7
