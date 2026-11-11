@@ -39,6 +39,8 @@ REMINDERS = [
 ]
 DATE_RE = r"(\d{4}-\d{2}-\d{2} \d{2}:\d{2})"
 ICON = {"done": "✅", "todo": "❌", "na": "📌", "?": "❔"}
+ATT_STATUS = ("present", "absent", "late", "other")  # the mark's column on the attendance page, left to right
+ATT_ICON = {"present": "✅", "absent": "❌", "late": "🕒", "other": "📝", None: "⏳"}
 RES_ICON = {"ubfile": "📄", "vod": "🎥", "folder": "📁", "url": "🔗", "page": "📝"}  # course items that need no submission
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -54,6 +56,7 @@ db.executescript(
     CREATE TABLE IF NOT EXISTS news(id TEXT PRIMARY KEY);
     CREATE TABLE IF NOT EXISTS resources(uid TEXT PRIMARY KEY, title TEXT, course TEXT, kind TEXT, url TEXT, first_seen INTEGER);
     CREATE TABLE IF NOT EXISTS grades(uid TEXT PRIMARY KEY, course TEXT, item TEXT, grade TEXT, max TEXT, pct TEXT, kind TEXT, updated INTEGER);
+    CREATE TABLE IF NOT EXISTS attendance(uid TEXT PRIMARY KEY, course TEXT, day TEXT, cls TEXT, status TEXT);
     """
 )
 for col in ("url", "kind", "status"):  # added later; migrate old databases
@@ -389,6 +392,44 @@ def scrape_grades():
     return out
 
 
+def parse_attendance(page):
+    """(course name or None, [(date 'YYYY-MM-DD', class label, status)]) from an offline-attendance page.
+
+    status is 'present' | 'absent' | 'late' | 'other', or None while the class hasn't been marked yet.
+    The list is empty when the course has no offline attendance ("There is no week found").
+    """
+    soup = BeautifulSoup(page, "html.parser")
+    name = None
+    for li in soup.select(".course_info li"):
+        if re.match(r"course name", li.get_text(strip=True), re.I):
+            name = li.get_text(" ", strip=True).split(":", 1)[-1].strip() or None
+    rows = []
+    for tr in soup.select("table.attendance_my tbody tr"):
+        cells = [c.get_text(" ", strip=True) for c in tr.find_all("td")]
+        if len(cells) != 6 or not re.fullmatch(r"\d{4}-\d{2}-\d{2}", cells[0]):
+            continue  # the "no week found" row
+        marks = [st for st, c in zip(ATT_STATUS, cells[2:]) if c]
+        rows.append((cells[0], cells[1], marks[0] if marks else None))
+    return name, rows
+
+
+def scrape_attendance():
+    """{course id: (course name, [(date, class, status)])} for every course whose page could be read. Blocking.
+
+    Courses without offline attendance come back with an empty list. One failing course doesn't stop the rest.
+    """
+    out = {}
+    for cid, fallback in list_courses().items():
+        try:
+            name, rows = parse_attendance(web_get(f"{MOODLE_URL}/local/ubattendance/my_status.php?id={cid}").text)
+            out[cid] = (name or fallback, rows)
+        except Exception as e:
+            if isinstance(e, RuntimeError):
+                raise
+            log.warning("attendance of course %s failed: %s", cid, e)
+    return out
+
+
 # ---------- sync jobs ----------
 _login_alerted = False
 
@@ -549,10 +590,36 @@ async def sync_grades():
         await bot.send_message(CHAT_ID, "📊 <b>New grades</b>\n\n" + "\n".join(alerts[i : i + 25]))
 
 
+def fmt_day(day):
+    return datetime.strptime(day, "%Y-%m-%d").strftime("%a %d %b")
+
+
+async def sync_attendance():
+    """Pull offline attendance from eclass; alert when a class is marked absent, late or other (first run only records)."""
+    if not (ECLASS_USERNAME and ECLASS_PASSWORD):
+        raise RuntimeError("ECLASS_USERNAME / ECLASS_PASSWORD not set")
+    first_run = db.execute("SELECT COUNT(*) FROM attendance").fetchone()[0] == 0
+    old = {uid: status for uid, status in db.execute("SELECT uid,status FROM attendance")}
+    found = await asyncio.to_thread(scrape_attendance)
+    alerts = []
+    for cid, (course, rows) in found.items():
+        db.execute("DELETE FROM attendance WHERE uid LIKE ?", (f"{cid}:%",))
+        seen = {}
+        for day, cls, status in rows:
+            n = seen[(day, cls)] = seen.get((day, cls), 0) + 1
+            uid = f"{cid}:{day}:{cls}" + (f"#{n}" if n > 1 else "")
+            db.execute("INSERT INTO attendance VALUES(?,?,?,?,?)", (uid, course, day, cls, status))
+            if not first_run and status not in (None, "present") and old.get(uid) != status:
+                alerts.append(f"• <b>{esc(short_course(course))}</b> · {fmt_day(day)} · {ATT_ICON[status]} {status}")
+    db.commit()
+    for i in range(0, len(alerts), 25):  # stay under Telegram's message size limit
+        await bot.send_message(CHAT_ID, "🗓 <b>Attendance</b>\n\n" + "\n".join(alerts[i : i + 25]))
+
+
 async def poll_loop():
     polls = 0
     while True:
-        jobs = [sync_events, sync_news] + ([sync_grades] if polls % GRADES_EVERY == 0 else [])
+        jobs = [sync_events, sync_news, sync_attendance] + ([sync_grades] if polls % GRADES_EVERY == 0 else [])
         polls += 1
         for job in jobs:
             try:
@@ -623,19 +690,57 @@ def render_grades(rows, detail):
     return "\n".join(out)
 
 
+def render_attendance(rows, detail):
+    """rows: (course, day, cls, status). One line per course, or (detail) every class that has been marked."""
+    courses = {}
+    for r in rows:
+        courses.setdefault(r[0], []).append(r)
+    out = []
+    for course, items in sorted(courses.items()):
+        items.sort(key=lambda r: r[1])
+        marked = [r for r in items if r[3] is not None]
+        pending = [r for r in items if r[3] is None]
+        count = lambda st: sum(1 for r in marked if r[3] == st)
+        head = f"<b>{esc(short_course(course))}</b>"
+        tail = f"{count('present')}/{len(marked)} attended"
+        tail += "".join(f" · {ATT_ICON[st]} {count(st)} {st}" for st in ATT_STATUS[1:] if count(st))
+        if pending:
+            tail += f" · {len(pending)} to come"
+        if not detail:
+            out.append(f"🗓 {head} · {tail}")
+            continue
+        out.append(("\n" if out else "") + f"{head} · {tail}")
+        out += [f"{ATT_ICON[r[3]]} {fmt_day(r[1])}" for r in marked]
+        if pending:
+            out.append(f"⏳ next: {fmt_day(pending[0][1])}")
+    return "\n".join(out)
+
+
+async def answer_chunks(m: Message, text):
+    """Send text in pieces under Telegram's limit (4096), splitting on lines so tags stay whole."""
+    chunk = ""
+    for ln in text.split("\n"):
+        if chunk and len(chunk) + len(ln) > 3500:
+            await m.answer(chunk)
+            chunk = ""
+        chunk += ("\n" if chunk else "") + ln
+    await m.answer(chunk)
+
+
 MENU = [
     ("upcoming", "Next 15 deadlines"),
     ("today", "Due in the next 24 hours"),
     ("week", "Due until the end of next Sunday"),
     ("resources", "Latest course materials"),
     ("grades", "Your grades"),
+    ("attendance", "Your offline attendance"),
     ("sync", "Refresh from eclass now"),
     ("help", "What this bot does"),
 ]
 KEYBOARD = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="/upcoming"), KeyboardButton(text="/today"), KeyboardButton(text="/week")],
-        [KeyboardButton(text="/resources"), KeyboardButton(text="/grades"), KeyboardButton(text="/sync"), KeyboardButton(text="/help")],
+        [KeyboardButton(text="/resources"), KeyboardButton(text="/grades"), KeyboardButton(text="/attendance"), KeyboardButton(text="/sync"), KeyboardButton(text="/help")],
     ],
     resize_keyboard=True,
     is_persistent=True,
@@ -650,15 +755,18 @@ HELP = (
     "/resources — latest course materials (files, videos, links). "
     "Add a word to filter: <code>/resources database</code>\n"
     "/grades — your course totals. Add a word for the details of one course: <code>/grades database</code>\n"
+    "/attendance — offline attendance of the courses that have it. Add a word for every class of one course: <code>/attendance operating</code>\n"
     "/sync — check eclass right now\n\n"
     "<b>Icons</b>\n"
     "❌ not submitted yet · ✅ submitted · ❔ can't tell (e.g. submitted elsewhere)\n"
-    "📄 file · 🎥 video · 📁 folder · 🔗 link · 📝 page\n\n"
+    "📄 file · 🎥 video · 📁 folder · 🔗 link · 📝 page\n"
+    "Attendance: ✅ present · ❌ absent · 🕒 late · 📝 other · ⏳ not taken yet\n\n"
     "<b>Automatic messages</b>\n"
     "🆕 new deadline · ⚠️ deadline moved\n"
     "⏰ reminder 7 days, 3 days, 1 day, 6 hours and 1 hour before a deadline (not for submitted work)\n"
     "📚 new course material\n"
     "📊 new or changed grade (checked every third refresh)\n"
+    "🗓 a class marked absent, late or other\n"
     "Tap a title to open it on eclass."
 )
 
@@ -708,13 +816,21 @@ async def cmd_grades(m: Message, command: CommandObject):
     if not rows:
         await m.answer("No grades found — try /sync first" if not command.args else "No course matches that")
         return
-    chunk = ""
-    for ln in render_grades(rows, detail=bool(command.args)).split("\n"):
-        if chunk and len(chunk) + len(ln) > 3500:  # Telegram's limit is 4096; split on lines so tags stay whole
-            await m.answer(chunk)
-            chunk = ""
-        chunk += ("\n" if chunk else "") + ln
-    await m.answer(chunk)
+    await answer_chunks(m, render_grades(rows, detail=bool(command.args)))
+
+
+@dp.message(Command("attendance"))
+async def cmd_attendance(m: Message, command: CommandObject):
+    """Offline attendance, only for courses that have it; '/attendance word' lists every class of matching courses."""
+    q, args = "SELECT course,day,cls,status FROM attendance", []
+    if command.args:
+        q += " WHERE course LIKE ?"
+        args = [f"%{command.args.strip()}%"]
+    rows = db.execute(q, args).fetchall()
+    if not rows:
+        await m.answer("No course matches that" if command.args else "No course has offline attendance yet — try /sync first")
+        return
+    await answer_chunks(m, render_attendance(rows, detail=bool(command.args)))
 
 
 @dp.message(Command("sync"))
@@ -723,6 +839,7 @@ async def cmd_sync(m: Message):
         await sync_events()
         await sync_news()
         await sync_grades()
+        await sync_attendance()
         await m.answer("Synced ✅")
     except Exception as e:
         await m.answer(f"Sync failed: {esc(e)}")

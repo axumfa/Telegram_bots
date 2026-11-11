@@ -29,5 +29,6 @@ def b(monkeypatch):
     botmod.db.execute("DELETE FROM events")
     botmod.db.execute("DELETE FROM reminded")
     botmod.db.execute("DELETE FROM grades")
+    botmod.db.execute("DELETE FROM attendance")
     botmod.sent = sent
     return botmod

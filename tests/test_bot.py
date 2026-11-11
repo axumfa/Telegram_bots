@@ -9,6 +9,7 @@ from bot import (
     TZ,
     clean_title,
     parse_activity_grade,
+    parse_attendance,
     parse_due,
     parse_grade_report,
     parse_overview,
@@ -91,7 +92,7 @@ async def test_new_resources_announced_once(b, monkeypatch):
 
 def test_menu_matches_handlers(b):
     cmds = {c for c, _ in b.MENU}
-    assert cmds == {"upcoming", "today", "week", "resources", "grades", "sync", "help"}
+    assert cmds == {"upcoming", "today", "week", "resources", "grades", "attendance", "sync", "help"}
     assert all(len(d) <= 256 for _, d in b.MENU)
     assert "<course>" not in b.HELP  # raw angle brackets would break Telegram's HTML parsing
 
@@ -235,7 +236,7 @@ async def test_failed_course_keeps_old_grades(b, monkeypatch):
 
 
 async def test_grades_checked_every_third_poll(b, monkeypatch):
-    calls = {"events": 0, "news": 0, "grades": 0}
+    calls = {"events": 0, "news": 0, "attendance": 0, "grades": 0}
 
     def counter(name):
         async def job():
@@ -255,7 +256,7 @@ async def test_grades_checked_every_third_poll(b, monkeypatch):
     monkeypatch.setattr(b.asyncio, "sleep", fake_sleep)
     with pytest.raises(asyncio.CancelledError):
         await b.poll_loop()
-    assert calls == {"events": 7, "news": 7, "grades": 3}  # polls 1, 4 and 7
+    assert calls == {"events": 7, "news": 7, "attendance": 7, "grades": 3}  # polls 1, 4 and 7
 
 
 # ---------- grades from assignment / quiz pages (courses that hide their gradebook) ----------
@@ -344,3 +345,89 @@ async def test_hidden_course_grade_alert_end_to_end(b, monkeypatch):
     state["2"] = ("Hidden[001]", [("HW 1", "9", "10", "90.00 %", "item"), ("HW 2", "5", "10", "50.00 %", "item")])
     await b.sync_grades()
     assert len(b.sent) == 1 and "HW 1" in b.sent[0] and "9/10 (90.00%)" in b.sent[0] and "HW 2" not in b.sent[0]
+
+
+# ---------- offline attendance ----------
+def test_parse_attendance_real_page():
+    name, rows = parse_attendance(fixture("attendance_os.html"))
+    assert name == "Operating System[202602-SOC3010-001]"
+    assert len(rows) == 18
+    assert rows[0] == ("2026-09-07", "1Class", "present")
+    assert [r[0] for r in rows if r[2] == "absent"] == ["2026-11-02", "2026-11-04"]
+    assert sum(r[2] == "present" for r in rows) == 16  # matches the page's own "Attendance : 16"
+
+
+def test_parse_attendance_unmarked_classes_are_pending():
+    _, rows = parse_attendance(fixture("attendance_pending.html"))
+    assert len(rows) == 26
+    assert sum(r[2] == "present" for r in rows) == 16
+    assert sum(r[2] is None for r in rows) == 10  # later weeks: not taken yet
+
+
+def test_parse_attendance_course_without_offline_attendance():
+    name, rows = parse_attendance(fixture("attendance_none.html"))  # "There is no week found."
+    assert rows == [] and name
+
+
+def test_parse_attendance_late_and_other_columns():
+    cell = lambda mark: f"<td>{mark}</td>"
+    page = ('<table class="attendance_my"><tbody>'
+            "<tr><td>2026-09-01</td><td>1Class</td>" + cell("") * 2 + cell("○") + cell("") + "</tr>"
+            "<tr><td>2026-09-02</td><td>2Class</td>" + cell("") * 3 + cell("○") + "</tr></tbody></table>")
+    assert [r[2] for r in parse_attendance(page)[1]] == ["late", "other"]
+
+
+def test_fixtures_hold_no_student_identity():
+    for f in ("attendance_os.html", "attendance_pending.html", "attendance_none.html"):
+        assert "Fullname" not in fixture(f) and "U2410045" not in fixture(f)
+
+
+def att(*classes):
+    """{course id: (name, rows)} with one course 'Operating System' and the given (date, status) classes."""
+    return {"1": ("Operating System[001]", [(d, f"{i}Class", st) for i, (d, st) in enumerate(classes, 1)])}
+
+
+def _scrape_att(monkeypatch, b, state):
+    monkeypatch.setattr(b, "ECLASS_USERNAME", "u")
+    monkeypatch.setattr(b, "ECLASS_PASSWORD", "p")
+    monkeypatch.setattr(b, "scrape_attendance", lambda: state)
+
+
+def test_render_attendance(b):
+    rows = [("Operating System[001]", "2026-11-04", "2Class", "absent"), ("Operating System[001]", "2026-11-02", "1Class", "present"),
+            ("Operating System[001]", "2026-11-09", "3Class", None), ("Algorithms[002]", "2026-11-02", "1Class", "present")]
+    out = b.render_attendance(rows, detail=False).split("\n")
+    assert out == ["🗓 <b>Algorithms</b> · 1/1 attended", "🗓 <b>Operating System</b> · 1/2 attended · ❌ 1 absent · 1 to come"]
+    detail = b.render_attendance(rows[:3], detail=True)
+    assert detail.index("✅ Mon 02 Nov") < detail.index("❌ Wed 04 Nov")  # chronological
+    assert "⏳ next: Mon 09 Nov" in detail
+
+
+async def test_attendance_first_sync_silent_then_alerts_on_absence_only_once(b, monkeypatch):
+    b.db.execute("DELETE FROM attendance")
+    _scrape_att(monkeypatch, b, att(("2026-11-02", "present"), ("2026-11-04", None)))
+    await b.sync_attendance()
+    assert b.sent == []  # first run only records
+
+    _scrape_att(monkeypatch, b, att(("2026-11-02", "present"), ("2026-11-04", "present")))
+    await b.sync_attendance()
+    assert b.sent == []  # being present is not worth a message
+
+    _scrape_att(monkeypatch, b, att(("2026-11-02", "present"), ("2026-11-04", "absent")))
+    await b.sync_attendance()
+    assert len(b.sent) == 1 and "Operating System" in b.sent[0] and "Wed 04 Nov" in b.sent[0] and "absent" in b.sent[0]
+
+    await b.sync_attendance()
+    assert len(b.sent) == 1  # same state again: nothing
+
+
+async def test_attendance_only_stores_courses_with_classes_and_keeps_failed_ones(b, monkeypatch):
+    b.db.execute("DELETE FROM attendance")
+    state = att(("2026-11-02", "present"))
+    state["2"] = ("Online course[001]", [])  # menu link but "no week found"
+    _scrape_att(monkeypatch, b, state)
+    await b.sync_attendance()
+    assert {r[0] for r in b.db.execute("SELECT course FROM attendance")} == {"Operating System[001]"}
+    monkeypatch.setattr(b, "scrape_attendance", lambda: {})  # every course failed this time
+    await b.sync_attendance()
+    assert b.db.execute("SELECT COUNT(*) FROM attendance").fetchone()[0] == 1
