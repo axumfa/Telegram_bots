@@ -652,3 +652,56 @@ def test_like_takes_wildcards_literally(b):
     for title, word, hit in [("100% done", "100%", True), ("1000 done", "100%", False), ("a_b", "a_b", True), ("axb", "a_b", False)]:
         row = b.db.execute("SELECT ? LIKE ? ESCAPE '\\'", (title, b.like(word))).fetchone()[0]
         assert bool(row) is hit
+
+
+# ---------- page cache ----------
+class FakeSession:
+    def __init__(self):
+        self.calls = []
+
+    def get(self, url, **kw):
+        self.calls.append(url)
+        return type("R", (), {"url": url, "text": f"page {url}", "ok": True})()
+
+
+async def test_pages_are_fetched_once_per_cycle_and_fresh_the_next_time(b, monkeypatch):
+    fake = FakeSession()
+    monkeypatch.setattr(b, "_web", fake)
+    seen = []
+
+    def job(name):
+        async def run():
+            seen.append(await asyncio.to_thread(b.web_get, "https://e/home"))  # like the scrapers: in a thread
+            await asyncio.to_thread(b.web_get, "https://e/c/1")
+        run.__name__ = name
+        return run
+
+    await b.run_cycle([job("sync_events"), job("sync_grades"), job("sync_attendance")])
+    assert fake.calls == ["https://e/home", "https://e/c/1"]  # not 6 requests
+    assert seen[0] is seen[1] is seen[2]
+    await b.run_cycle([job("sync_events")])
+    assert len(fake.calls) == 4  # the next cycle starts empty: nothing is ever stale
+    await asyncio.to_thread(b.web_get, "https://e/home")
+    assert len(fake.calls) == 5  # outside a cycle there is no cache
+
+
+async def test_overlapping_cycles_do_not_share_a_cache(b, monkeypatch):
+    fake = FakeSession()
+    monkeypatch.setattr(b, "_web", fake)
+    gate = asyncio.Event()
+
+    async def slow():
+        await asyncio.to_thread(b.web_get, "https://e/x")
+        await gate.wait()
+    slow.__name__ = "sync_events"
+
+    async def quick():
+        await asyncio.to_thread(b.web_get, "https://e/x")
+    quick.__name__ = "sync_grades"
+
+    first = asyncio.create_task(b.run_cycle([slow]))
+    await asyncio.sleep(0.05)
+    await b.run_cycle([quick], alert=False)  # like /sync while a poll is running
+    gate.set()
+    await first
+    assert fake.calls == ["https://e/x", "https://e/x"]  # /sync really re-read the page

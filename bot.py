@@ -1,4 +1,5 @@
 import asyncio
+import contextvars
 import html
 import logging
 import os
@@ -171,14 +172,25 @@ def web_login():
     _web = s
 
 
+_page_cache = contextvars.ContextVar("page_cache", default=None)  # {url: response} while a cycle runs
+
+
 def web_get(url, **kw):
-    """GET with the logged-in session, logging in again if it expired. Blocking."""
+    """GET with the logged-in session, logging in again if it expired. Blocking.
+
+    Inside run_cycle() a page is fetched once and shared by every job of that cycle.
+    """
+    cache = _page_cache.get()
+    if cache is not None and not kw and url in cache:
+        return cache[url]
     if _web is None:
         web_login()
     r = _web.get(url, timeout=30, **kw)
     if _is_login_page(r):
         web_login()
         r = _web.get(url, timeout=30, **kw)
+    if cache is not None and not kw and r.ok:
+        cache[url] = r
     return r
 
 
@@ -655,13 +667,24 @@ async def run_job(job, alert=True):
     return None
 
 
+async def run_cycle(jobs, alert=True):
+    """run_job for each job in turn, sharing one page cache so the jobs don't fetch the same eclass page again.
+
+    The cache lives only for this call, so every poll and every /sync reads fresh pages.
+    """
+    token = _page_cache.set({})
+    try:
+        return [await run_job(job, alert) for job in jobs]
+    finally:
+        _page_cache.reset(token)
+
+
 async def poll_loop():
     polls = 0
     while True:
         jobs = [sync_events, sync_attendance] + ([sync_grades] if polls % GRADES_EVERY == 0 else [])
         polls += 1
-        for job in jobs:
-            await run_job(job)
+        await run_cycle(jobs)
         await asyncio.sleep(POLL_MINUTES * 60)
 
 
@@ -956,11 +979,9 @@ async def cmd_attendance(m: Message, command: CommandObject):
 
 @dp.message(Command("sync"))
 async def cmd_sync(m: Message):
-    failed = []
-    for job in (sync_events, sync_grades, sync_attendance):  # one failing job doesn't stop the others
-        err = await run_job(job, alert=False)
-        if err:
-            failed.append(f"{JOB_LABEL[job.__name__]}: {esc(err) or type(err).__name__}")
+    jobs = (sync_events, sync_grades, sync_attendance)  # one failing job doesn't stop the others
+    errors = await run_cycle(jobs, alert=False)
+    failed = [f"{JOB_LABEL[j.__name__]}: {esc(e) or type(e).__name__}" for j, e in zip(jobs, errors) if e]
     await m.answer("Synced ✅" if not failed else "Synced, but:\n" + "\n".join(failed))
 
 

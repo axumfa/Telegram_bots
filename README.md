@@ -15,6 +15,8 @@ Telegram bot that tracks deadlines from eclass.inha.ac.kr (Moodle). Single file:
 
 **Quiet messages**: 📚 new material, 📊 grades, ✅ "works again" and a 🆕 deadline more than 3 days away arrive without a notification sound; deadlines, reminders, absences and "a check is failing" ping as usual.
 
+Each refresh reads every eclass page at most once, even when deadlines, grades and attendance all need it; the next refresh and `/sync` always read fresh pages. `/status` shows when each check last worked.
+
 Message format: `❌ Homework 04 · Electronic Circuit · 23:59 · 1d 10h` (the title links to the activity).
 
 ## Setup
