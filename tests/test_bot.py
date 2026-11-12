@@ -1,6 +1,6 @@
 import asyncio
 import time
-from datetime import datetime, time as dtime
+from datetime import date, datetime, time as dtime
 from pathlib import Path
 
 import pytest
@@ -16,6 +16,8 @@ from bot import (
     parse_grade_report,
     parse_overview,
     parse_status,
+    parse_syllabus,
+    parse_week_ranges,
     short_course,
     week_end,
 )
@@ -94,7 +96,7 @@ async def test_new_resources_announced_once(b, monkeypatch):
 
 def test_menu_matches_handlers(b):
     cmds = {c for c, _ in b.MENU}
-    assert cmds == {"upcoming", "today", "week", "missed", "nodeadline", "done", "resources", "grades", "attendance", "inbox", "sync", "status", "help"}
+    assert cmds == {"upcoming", "today", "week", "missed", "nodeadline", "done", "resources", "grades", "attendance", "inbox", "exams", "sync", "status", "help"}
     assert all(len(d) <= 256 for _, d in b.MENU)
     assert "<course>" not in b.HELP  # raw angle brackets would break Telegram's HTML parsing
 
@@ -238,7 +240,7 @@ async def test_failed_course_keeps_old_grades(b, monkeypatch):
 
 
 async def test_grades_checked_every_third_poll(b, monkeypatch):
-    calls = {"events": 0, "attendance": 0, "inbox": 0, "grades": 0}
+    calls = {"events": 0, "attendance": 0, "inbox": 0, "exams": 0, "grades": 0}
 
     def counter(name):
         async def job():
@@ -258,7 +260,7 @@ async def test_grades_checked_every_third_poll(b, monkeypatch):
     monkeypatch.setattr(b.asyncio, "sleep", fake_sleep)
     with pytest.raises(asyncio.CancelledError):
         await b.poll_loop()
-    assert calls == {"events": 7, "attendance": 7, "inbox": 7, "grades": 3}  # polls 1, 4 and 7
+    assert calls == {"events": 7, "attendance": 7, "inbox": 7, "exams": 1, "grades": 3}  # exams on poll 1 only  # polls 1, 4 and 7
 
 
 # ---------- grades from assignment / quiz pages (courses that hide their gradebook) ----------
@@ -958,3 +960,121 @@ async def test_undated_item_that_gets_a_deadline_moves_to_events(b, monkeypatch)
 def test_undated_line_shows_submitted_state(b):
     assert b.undated_line(("Homework 2 - X", COURSE, "https://e/1", "?")) == '📌 <a href="https://e/1">Homework 2 - X</a> · Electronic Circuit'
     assert b.undated_line(("HW", COURSE, None, "done")).startswith("✅ HW")
+
+
+# ---------- exam weeks ----------
+def test_parse_syllabus_weights_and_exam_weeks():
+    assert parse_syllabus(fixture("syllabus_os.html")) == ({"midterm": "25%", "final": "25%"}, {"midterm": 8, "final": 15})
+    # a syllabus that gives weights but no exam weeks in its plan (the weeks are simply unknown)
+    assert parse_syllabus(fixture("syllabus_no_weeks.html")) == ({"midterm": "35%", "final": "40%"}, {})
+    assert parse_syllabus("<p>nothing</p>") == ({}, {})
+
+
+@pytest.mark.parametrize("label, kind", [("Midterm", "midterm"), ("MidTerm", "midterm"), ("Mid-term", "midterm"), ("Final Exam", "final"), ("Final exam", "final")])
+def test_parse_syllabus_exam_week_spellings(label, kind):
+    assert parse_syllabus(f"<p>7 Theme {label} Class Details</p>")[1] == {kind: 7}
+
+
+def test_parse_week_ranges_infers_the_year():
+    r = parse_week_ranges(fixture("course_weeks.html"), date(2026, 11, 13))
+    assert len(r) == 16
+    assert r[1] == (date(2026, 9, 5), date(2026, 9, 11))
+    assert r[8] == (date(2026, 10, 24), date(2026, 10, 30))
+    assert r[16] == (date(2026, 12, 19), date(2026, 12, 25))
+    assert r == parse_week_ranges(fixture("course_weeks.html"), date(2026, 9, 1))  # same answer before the semester starts
+
+
+def test_parse_week_ranges_over_new_year():
+    html = "".join(f'<a href="#section-{i}">{i}Week [{a} - {b}]</a>' for i, (a, b) in
+                   enumerate([("22 December", "28 December"), ("29 December", "04 January"), ("05 January", "11 January")], 1))
+    r = parse_week_ranges(html, date(2026, 12, 30))
+    assert r[2] == (date(2026, 12, 29), date(2027, 1, 4)) and r[3] == (date(2027, 1, 5), date(2027, 1, 11))
+    assert parse_week_ranges("<p>no sections</p>", date(2026, 1, 1)) == {}
+
+
+def test_fmt_range_and_exam_when(b):
+    assert b.fmt_range("2026-10-24", "2026-10-30") == "24–30 Oct"
+    assert b.fmt_range("2026-10-28", "2026-11-03") == "28 Oct – 3 Nov"
+    w = ("2026-12-12", "2026-12-18")
+    assert b.exam_when(*w, date(2026, 12, 11)) == "tomorrow"
+    assert b.exam_when(*w, date(2026, 11, 13)) == "in 29 days"
+    assert b.exam_when(*w, date(2026, 12, 12)) == "🔥 this week" and b.exam_when(*w, date(2026, 12, 18)) == "🔥 this week"
+    assert b.exam_when(*w, date(2026, 12, 19)) == "passed"
+    assert b.exam_when(None, None, date(2026, 12, 19)) is None
+
+
+def test_render_exams_orders_soonest_first_unknown_then_passed(b):
+    rows = [("Database[001]", "midterm", 7, "2026-10-17", "2026-10-23", "30%"),
+            ("Operating System[001]", "final", 15, "2026-12-12", "2026-12-18", "25%"),
+            ("Operating System[001]", "midterm", 8, "2026-10-24", "2026-10-30", "25%"),
+            ("Engineering Communications[001]", "final", None, None, None, "40%")]
+    out = b.render_exams(rows, date(2026, 10, 27)).split("\n")
+    assert out[0] == "📝 <b>Operating System</b> · Midterm · week 8 (24–30 Oct) · 25% of the grade · 🔥 this week"
+    assert out[1] == "🏁 <b>Operating System</b> · Final · week 15 (12–18 Dec) · 25% of the grade · in 46 days"
+    assert out[2] == "🏁 <b>Engineering Communications</b> · Final · week not in the syllabus · 40% of the grade"
+    assert out[3].endswith("· passed") and "Database" in out[3]
+
+
+async def test_sync_exams_replaces_a_courses_rows_and_keeps_failed_ones(b, monkeypatch):
+    b.db.execute("DELETE FROM exams")
+    monkeypatch.setattr(b, "ECLASS_USERNAME", "u")
+    monkeypatch.setattr(b, "ECLASS_PASSWORD", "p")
+    state = {"1": ("OS[001]", [("midterm", 8, "2026-10-24", "2026-10-30", "25%"), ("final", 15, "2026-12-12", "2026-12-18", "25%")]),
+             "2": ("Online[001]", [])}
+    monkeypatch.setattr(b, "scrape_exams", lambda: state)
+    await b.sync_exams()
+    assert b.db.execute("SELECT COUNT(*) FROM exams").fetchone()[0] == 2
+    state["1"] = ("OS[001]", [("final", 16, "2026-12-19", "2026-12-25", "30%")])  # the syllabus changed
+    await b.sync_exams()
+    assert b.db.execute("SELECT kind,week,weight FROM exams").fetchall() == [("final", 16, "30%")]
+    monkeypatch.setattr(b, "scrape_exams", lambda: {})  # everything failed this time
+    await b.sync_exams()
+    assert b.db.execute("SELECT COUNT(*) FROM exams").fetchone()[0] == 1
+
+
+def _scrape_exams_pages(monkeypatch, b):
+    pages = {"course": fixture("course_weeks.html"), "syl": fixture("syllabus_os.html")}
+    monkeypatch.setattr(b, "list_courses", lambda: {"1": "Fallback name"})
+    monkeypatch.setattr(b, "web_get", lambda url, **kw: type("R", (), {"text": pages["syl"] if "syllabus" in url else pages["course"]})())
+
+
+def test_scrape_exams_combines_syllabus_and_week_dates(b, monkeypatch):
+    _scrape_exams_pages(monkeypatch, b)
+    (cid, (name, rows)), = b.scrape_exams().items()
+    assert cid == "1" and name == "Fallback name"  # no <h1> in the fixture
+    wk = dict(parse_week_ranges(fixture("course_weeks.html"), datetime.now(TZ).date()))
+    assert [(r[0], r[1], r[4]) for r in rows] == [("midterm", 8, "25%"), ("final", 15, "25%")]
+    assert rows[0][2:4] == (wk[8][0].isoformat(), wk[8][1].isoformat())
+
+
+def _exam(b, kind, start, end):
+    b.db.execute("INSERT INTO exams VALUES('1','Operating System[001]',?,8,?,?,'25%')", (kind, start, end))
+
+
+async def test_exam_reminders_at_7_and_1_days_daytime_only_once(b):
+    b.db.execute("DELETE FROM exams")
+    b.db.execute("DELETE FROM reminded")
+    _exam(b, "midterm", "2026-10-24", "2026-10-30")
+    _exam(b, "final", "2026-12-12", "2026-12-18")
+    at = lambda day, hh: datetime.strptime(f"{day} {hh}", "%Y-%m-%d %H:%M").replace(tzinfo=TZ)
+    await b.check_exam_reminders(now=at("2026-10-10", "12:00"))  # two weeks out
+    await b.check_exam_reminders(now=at("2026-10-17", "03:00"))  # 7 days, but night
+    assert b.sent == []
+    await b.check_exam_reminders(now=at("2026-10-17", "09:00"))
+    assert len(b.sent) == 1 and "under a week" in b.sent[0] and "Midterm" in b.sent[0] and "Final" not in b.sent[0]
+    await b.check_exam_reminders(now=at("2026-10-18", "09:00"))
+    assert len(b.sent) == 1  # nothing repeats
+    await b.check_exam_reminders(now=at("2026-10-23", "09:00"))
+    assert len(b.sent) == 2 and "1 day" in b.sent[1]
+    await b.check_exam_reminders(now=at("2026-10-24", "09:00"))  # the week has started
+    assert len(b.sent) == 2
+
+
+async def test_exam_reminder_when_first_seen_late_skips_the_older_one(b):
+    b.db.execute("DELETE FROM exams")
+    b.db.execute("DELETE FROM reminded")
+    _exam(b, "midterm", "2026-10-24", "2026-10-30")
+    at = lambda day, hh: datetime.strptime(f"{day} {hh}", "%Y-%m-%d %H:%M").replace(tzinfo=TZ)
+    await b.check_exam_reminders(now=at("2026-10-23", "09:00"))  # first look: already 1 day out
+    await b.check_exam_reminders(now=at("2026-10-23", "10:00"))
+    assert len(b.sent) == 1 and "1 day" in b.sent[0]

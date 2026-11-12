@@ -6,7 +6,7 @@ import logging
 import os
 import re
 import sqlite3
-from datetime import datetime, time as dtime, timedelta, timezone
+from datetime import date, datetime, time as dtime, timedelta, timezone
 from urllib.parse import urlparse
 from zoneinfo import ZoneInfo
 
@@ -40,6 +40,7 @@ MISSED_DAYS = 30  # /missed looks back this far
 _digest = os.getenv("DIGEST_TIME", "").strip()  # "08:00" sends a morning summary; empty = off
 DIGEST_AT = datetime.strptime(_digest, "%H:%M").time() if _digest else None
 DIGEST_WINDOW = timedelta(hours=3)  # a digest is only sent this long after DIGEST_TIME, never as a stale afternoon message
+EXAMS_EVERY = 72  # re-read syllabi on every 72nd poll (about daily); /sync always does
 SILENT_BEYOND_DAYS = 3  # a new deadline further away than this arrives without a sound
 FAIL_ALERT = 3  # consecutive failures of one job before the bot tells you
 TZ = ZoneInfo("Asia/Tashkent")
@@ -60,6 +61,7 @@ INBOX_ICON = {"feedback": "💬", "announcement": "📢", "urgent": "🚨", "mes
 INBOX_LABEL = {"feedback": "Feedback", "announcement": "Announcement", "urgent": "Urgent", "message": "Message"}
 INBOX_LOUD = ("feedback", "announcement", "urgent")  # these ping; plain messages arrive silently
 URGENT_RE = re.compile(r"urgent|\basap\b|cancel|postpone|reschedul|campus is closed|(?:don'?t|do not) come|no class|휴강|보강|취소|긴급|연기", re.I)
+EXAM_KINDS = {"midterm": ("Midterm", "📝"), "final": ("Final", "🏁")}
 RES_ICON = {"ubfile": "📄", "vod": "🎥", "folder": "📁", "url": "🔗", "page": "📝"}  # course items that need no submission
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -78,6 +80,7 @@ db.executescript(
     CREATE TABLE IF NOT EXISTS grades(uid TEXT PRIMARY KEY, course TEXT, item TEXT, grade TEXT, max TEXT, pct TEXT, kind TEXT, updated INTEGER);
     CREATE TABLE IF NOT EXISTS health(job TEXT PRIMARY KEY, last_ok INTEGER, last_err TEXT, fails INTEGER NOT NULL DEFAULT 0, alerted INTEGER NOT NULL DEFAULT 0);
     CREATE TABLE IF NOT EXISTS undated(uid TEXT PRIMARY KEY, title TEXT, course TEXT, kind TEXT, url TEXT, status TEXT, first_seen INTEGER);
+    CREATE TABLE IF NOT EXISTS exams(cid TEXT, course TEXT, kind TEXT, week INTEGER, start TEXT, end TEXT, weight TEXT, PRIMARY KEY(cid, kind));
     CREATE TABLE IF NOT EXISTS kv(key TEXT PRIMARY KEY, value TEXT);
     CREATE TABLE IF NOT EXISTS inbox(uid TEXT PRIMARY KEY, kind TEXT, course TEXT, sender TEXT, ts TEXT, title TEXT, url TEXT, preview TEXT);
     CREATE TABLE IF NOT EXISTS attendance(uid TEXT PRIMARY KEY, course TEXT, day TEXT, cls TEXT, status TEXT);
@@ -463,6 +466,61 @@ def scrape_attendance():
     return out
 
 
+def parse_syllabus(page):
+    """({'midterm': '25%', 'final': '25%'} grading weights, {'midterm': 8, 'final': 15} exam weeks) from a syllabus page.
+
+    Either dict is missing a key the syllabus doesn't state.
+    """
+    soup = BeautifulSoup(page, "html.parser")
+    weights = {}
+    for tr in soup.select("tr"):
+        nxt = tr.find_next_sibling("tr")
+        if tr.find("table") or not nxt or nxt.find("table"):
+            continue  # an outer layout row
+        head = [c.get_text(" ", strip=True) for c in tr.find_all(["th", "td"], recursive=False)]
+        vals = [c.get_text(" ", strip=True) for c in nxt.find_all(["th", "td"], recursive=False)]
+        if len(head) == len(vals) >= 3 and all(re.fullmatch(r"[\d.]*%", v) for v in vals):
+            for h, v in zip(head, vals):
+                kind = "midterm" if re.search(r"mid", h, re.I) else "final" if re.search(r"final", h, re.I) else None
+                if kind and v not in (".0%", "0%", "0.0%"):
+                    weights.setdefault(kind, re.sub(r"\.0%$", "%", v))
+    weeks = {}
+    text = " ".join(soup.get_text(" ").split())
+    for m in re.finditer(r"(?<!\d)(\d{1,2})\s+Theme\s+(Mid-?\s?term|Final)\b", text, re.I):
+        weeks.setdefault("midterm" if re.match(r"mid", m.group(2), re.I) else "final", int(m.group(1)))
+    return weights, weeks
+
+
+def parse_week_ranges(page, today):
+    """{week number: (first day, last day)} from a course page's section titles like '8Week [24 October - 30 October]'.
+
+    The titles carry no year: week 1 gets the latest year that doesn't start more than 100 days from now, and
+    later weeks follow it (rolling into the next year when the dates wrap).
+    """
+    soup = BeautifulSoup(page, "html.parser")
+    found = {}
+    for a in soup.select("a[href*='#section-']"):
+        m = re.match(r"(\d+)\s*Week\s*\[(\d{1,2}\s+[A-Za-z]+)\s*-\s*(\d{1,2}\s+[A-Za-z]+)\]", " ".join(a.get_text(" ").split()))
+        if m:
+            found.setdefault(int(m.group(1)), (m.group(2), m.group(3)))
+    out, year, prev = {}, None, None
+    for wk in sorted(found):
+        try:
+            first = datetime.strptime(f"{found[wk][0]} 2000", "%d %B %Y")
+            last = datetime.strptime(f"{found[wk][1]} 2000", "%d %B %Y")
+        except ValueError:
+            continue
+        if year is None:
+            year = max((y for y in range(today.year - 1, today.year + 2) if date(y, first.month, first.day) <= today + timedelta(days=100)), default=today.year)
+        elif prev and (first.month, first.day) < (prev.month, prev.day):
+            year += 1
+        prev = first
+        start = date(year, first.month, first.day)
+        end = date(year + (1 if (last.month, last.day) < (first.month, first.day) else 0), last.month, last.day)
+        out[wk] = (start, end)
+    return out
+
+
 def _clean(text, n):
     text = re.sub(r"-{5,}", " ", text)
     text = " ".join(text.split())
@@ -549,6 +607,32 @@ def scrape_inbox():
             log.warning("inbox %s: page not recognised", src)
         else:
             out[src] = items
+    return out
+
+
+def scrape_exams():
+    """{course id: (course name, [(kind, week or None, first day 'YYYY-MM-DD' or None, last day or None, weight or None)])}. Blocking.
+
+    Weights and exam weeks come from the syllabus, the dates of each week from the course page. A course whose
+    syllabus states neither gets an empty list. One failing course doesn't stop the rest.
+    """
+    out, today = {}, datetime.now(TZ).date()
+    for cid, fallback in list_courses().items():
+        try:
+            page = web_get(f"{MOODLE_URL}/course/view.php?id={cid}").text
+            h1 = BeautifulSoup(page, "html.parser").find("h1")
+            ranges = parse_week_ranges(page, today)
+            weights, weeks = parse_syllabus(web_get(f"{MOODLE_URL}/local/ubion/setting/syllabus.php?id={cid}").text)
+            rows = []
+            for kind in EXAM_KINDS:
+                wk, rng = weeks.get(kind), ranges.get(weeks.get(kind))
+                if wk is not None or kind in weights:
+                    rows.append((kind, wk, rng and rng[0].isoformat(), rng and rng[1].isoformat(), weights.get(kind)))
+            out[cid] = (h1.get_text(" ", strip=True) if h1 else fallback, rows)
+        except RuntimeError:
+            raise
+        except Exception as e:
+            log.warning("exams of course %s failed: %s", cid, e)
     return out
 
 
@@ -766,6 +850,78 @@ async def sync_inbox():
             await bot.send_message(CHAT_ID, "\n\n".join(inbox_item(r) for r in group[i : i + 6]), disable_notification=not loud)
 
 
+async def sync_exams():
+    """Exam weeks and grading weights from the syllabi (a course that fails keeps its old rows)."""
+    if not (ECLASS_USERNAME and ECLASS_PASSWORD):
+        raise RuntimeError("ECLASS_USERNAME / ECLASS_PASSWORD not set")
+    for cid, (course, rows) in (await asyncio.to_thread(scrape_exams)).items():
+        db.execute("DELETE FROM exams WHERE cid=?", (cid,))
+        db.executemany("INSERT INTO exams VALUES(?,?,?,?,?,?,?)", [(cid, course, *r) for r in rows])
+    db.commit()
+
+
+def fmt_range(start, end):
+    a, b = date.fromisoformat(start), date.fromisoformat(end)
+    return f"{a.day}–{b.day} {b.strftime('%b')}" if (a.month, a.year) == (b.month, b.year) else f"{a.day} {a.strftime('%b')} – {b.day} {b.strftime('%b')}"
+
+
+def exam_when(start, end, today):
+    """'passed' | '🔥 this week' | 'tomorrow' | 'in N days'; None while the week's dates are unknown."""
+    if not start:
+        return None
+    a, b = date.fromisoformat(start), date.fromisoformat(end)
+    if today > b:
+        return "passed"
+    if today >= a:
+        return "🔥 this week"
+    d = (a - today).days
+    return "tomorrow" if d == 1 else f"in {d} days"
+
+
+def exam_line(row, today):
+    course, kind, week, start, end, weight = row
+    label, icon = EXAM_KINDS[kind]
+    parts = [f"{icon} <b>{esc(short_course(course))}</b>", label]
+    if week is not None:
+        parts.append(f"week {week}" + (f" ({fmt_range(start, end)})" if start else ""))
+    else:
+        parts.append("week not in the syllabus")
+    if weight:
+        parts.append(f"{esc(weight)} of the grade")
+    when = exam_when(start, end, today)
+    return " · ".join(parts + ([when] if when else []))
+
+
+def render_exams(rows, today):
+    """Upcoming and current exam weeks first (soonest first), then the ones without dates, then the passed ones."""
+    def order(r):
+        when = exam_when(r[3], r[4], today)
+        return (2 if when == "passed" else 1 if when is None else 0, r[3] or "", r[0])
+    return "\n".join(exam_line(r, today) for r in sorted(rows, key=order))
+
+
+async def check_exam_reminders(now=None):
+    """A heads-up 7 days and 1 day before an exam week starts (daytime only), once each."""
+    now = now or datetime.now(TZ)
+    if not 8 <= now.hour < 22:
+        return
+    rows = db.execute("SELECT cid,course,kind,week,start,end,weight FROM exams WHERE start IS NOT NULL ORDER BY start").fetchall()
+    batches = {}
+    for cid, course, kind, week, start, end, weight in rows:
+        days = (date.fromisoformat(start) - now.date()).days
+        if not 1 <= days <= 7:
+            continue
+        uid, label = f"exam:{cid}:{kind}", "1d" if days <= 1 else "7d"
+        if db.execute("SELECT 1 FROM reminded WHERE uid=? AND label=?", (uid, label)).fetchone():
+            continue
+        for lbl in ("1d", "7d") if label == "1d" else ("7d",):
+            db.execute("INSERT OR IGNORE INTO reminded VALUES(?,?)", (uid, lbl))  # don't fire the larger one later
+        batches.setdefault(label, []).append((course, kind, week, start, end, weight))
+    db.commit()
+    for label, items in batches.items():
+        await bot.send_message(CHAT_ID, f"🎓 <b>Exam week in {'1 day' if label == '1d' else 'under a week'}</b>\n" + "\n".join(exam_line(r, now.date()) for r in items))
+
+
 async def sync_attendance():
     """Pull offline attendance from eclass; alert when a class is marked absent, late or other (first run only records)."""
     if not (ECLASS_USERNAME and ECLASS_PASSWORD):
@@ -795,6 +951,8 @@ JOB_LABEL = {
     "sync_grades": "grades",
     "check_reminders": "reminders",
     "check_digest": "daily digest",
+    "sync_exams": "exam weeks",
+    "check_exam_reminders": "exam reminders",
 }
 
 
@@ -857,7 +1015,9 @@ async def run_cycle(jobs, alert=True):
 async def poll_loop():
     polls = 0
     while True:
-        jobs = [sync_events, sync_attendance, sync_inbox] + ([sync_grades] if polls % GRADES_EVERY == 0 else [])
+        jobs = [sync_events, sync_attendance, sync_inbox]
+        jobs += [sync_grades] if polls % GRADES_EVERY == 0 else []
+        jobs += [sync_exams] if polls % EXAMS_EVERY == 0 else []
         polls += 1
         await run_cycle(jobs)
         await asyncio.sleep(POLL_MINUTES * 60)
@@ -866,6 +1026,7 @@ async def poll_loop():
 async def reminder_loop():
     while True:
         await run_job(check_reminders)
+        await run_job(check_exam_reminders)
         if DIGEST_AT:
             await run_job(check_digest)
         await asyncio.sleep(300)
@@ -1026,6 +1187,7 @@ MENU = [
     ("grades", "Your grades"),
     ("attendance", "Your offline attendance"),
     ("inbox", "Latest messages and notices"),
+    ("exams", "Midterm and final weeks"),
     ("sync", "Refresh from eclass now"),
     ("status", "Is the bot working?"),
     ("help", "What this bot does"),
@@ -1033,7 +1195,7 @@ MENU = [
 KEYBOARD = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="/upcoming"), KeyboardButton(text="/today"), KeyboardButton(text="/week"), KeyboardButton(text="/missed")],
-        [KeyboardButton(text="/resources"), KeyboardButton(text="/grades"), KeyboardButton(text="/attendance")],
+        [KeyboardButton(text="/resources"), KeyboardButton(text="/grades"), KeyboardButton(text="/attendance"), KeyboardButton(text="/exams")],
         [KeyboardButton(text="/inbox"), KeyboardButton(text="/sync"), KeyboardButton(text="/status"), KeyboardButton(text="/help")],
     ],
     resize_keyboard=True,
@@ -1053,6 +1215,7 @@ HELP = (
     "Add a word to filter: <code>/resources database</code>\n"
     "/grades — your course totals. Add a word for the details of one course: <code>/grades database</code>\n"
     "/attendance — offline attendance of the courses that have it. Add a word for every class of one course: <code>/attendance operating</code>\n"
+    "/exams — midterm and final weeks (with dates, weight and countdown), from the syllabi. Add a word to filter: <code>/exams database</code>\n"
     "/inbox — latest messages (feedback, announcements, teachers) and notices. Add a word to filter: <code>/inbox attendance</code>\n"
     "/sync — check eclass right now\n"
     "/status — when each check last worked, and whether anything is failing\n\n"
@@ -1065,6 +1228,7 @@ HELP = (
     "⏰ reminder 7 days, 3 days, 1 day, 6 hours and 1 hour before a deadline (not for submitted work). "
     "Its buttons: ✅ done · 🔕 mute · ↩️ undo\n"
     "📚 new course material\n"
+    "🎓 an exam week coming up (7 days and 1 day before it starts)\n"
     "☀️ a morning summary of what is due today and tomorrow, if you turned it on (nothing due: no message)\n"
     "📊 new or changed grade (checked every third refresh)\n"
     "🗓 a class marked absent, late or other\n"
@@ -1143,6 +1307,20 @@ async def cmd_missed(m: Message):
     await reply_list(m, missed(), f"Nothing missed in the last {MISSED_DAYS} days 🎉")
 
 
+@dp.message(Command("exams"))
+async def cmd_exams(m: Message, command: CommandObject):
+    """Midterm and final weeks with their dates and weight; '/exams word' filters by course."""
+    q, args = "SELECT course,kind,week,start,end,weight FROM exams", []
+    if command.args:
+        q += " WHERE course LIKE ? ESCAPE '\\'"
+        args = [like(command.args)]
+    rows = db.execute(q, args).fetchall()
+    if not rows:
+        await m.answer("No course matches that" if command.args else "No exam weeks known yet — try /sync first")
+        return
+    await m.answer(render_exams(rows, datetime.now(TZ).date()) + "\n\n<i>Weeks as listed in each syllabus; the exact day is up to your teacher.</i>")
+
+
 @dp.message(Command("inbox"))
 async def cmd_inbox(m: Message, command: CommandObject):
     """Latest messages and notices; '/inbox word' filters by course, sender or title."""
@@ -1197,7 +1375,7 @@ async def cmd_attendance(m: Message, command: CommandObject):
 
 @dp.message(Command("sync"))
 async def cmd_sync(m: Message):
-    jobs = (sync_events, sync_grades, sync_attendance, sync_inbox)  # one failing job doesn't stop the others
+    jobs = (sync_events, sync_grades, sync_attendance, sync_inbox, sync_exams)  # one failing job doesn't stop the others
     errors = await run_cycle(jobs, alert=False)
     failed = [f"{JOB_LABEL[j.__name__]}: {esc(e) or type(e).__name__}" for j, e in zip(jobs, errors) if e]
     await m.answer("Synced ✅" if not failed else "Synced, but:\n" + "\n".join(failed))
