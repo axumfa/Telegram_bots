@@ -94,7 +94,7 @@ async def test_new_resources_announced_once(b, monkeypatch):
 
 def test_menu_matches_handlers(b):
     cmds = {c for c, _ in b.MENU}
-    assert cmds == {"upcoming", "today", "week", "missed", "done", "resources", "grades", "attendance", "inbox", "sync", "status", "help"}
+    assert cmds == {"upcoming", "today", "week", "missed", "nodeadline", "done", "resources", "grades", "attendance", "inbox", "sync", "status", "help"}
     assert all(len(d) <= 256 for _, d in b.MENU)
     assert "<course>" not in b.HELP  # raw angle brackets would break Telegram's HTML parsing
 
@@ -900,3 +900,61 @@ def test_render_inbox(b):
     out = b.render_inbox(rows).split("\n")
     assert out[0] == '📢 <a href="https://e/1">Exam &lt;room&gt;</a> · Operating System · 2026-11-10'
     assert out[1] == "✉️ hello · Database · 2026-11-09"
+
+
+# ---------- items without a deadline ----------
+NODUE = "<div class='submissionsummarytable'><table><tr><td>Submission status</td><td>No attempt</td></tr></table></div><p>Submit on Gradescope</p>"
+
+
+def _site(monkeypatch, b, pages):
+    monkeypatch.setattr(b, "list_courses", lambda: {"1": "C"})
+    monkeypatch.setattr(b, "course_activities", lambda cid, name: ("C", [("assign", mid, t, f"https://e/{mid}") for mid, t in pages], []))
+    monkeypatch.setattr(b, "web_get", lambda url, **kw: type("R", (), {"text": NODUE if url.endswith(("/1", "/3")) else ASSIGN})())
+
+
+def test_items_without_a_deadline_are_returned_with_no_timestamp(b, monkeypatch):
+    _site(monkeypatch, b, [("1", "Homework 2"), ("2", "Homework 3")])
+    found, _ = b.scrape_courses({})
+    assert [(f[0], f[3] is None) for f in found] == [("assign-1", True), ("assign-2", False)]
+
+
+def test_a_known_item_whose_page_lost_its_date_is_not_called_undated(b, monkeypatch):
+    _site(monkeypatch, b, [("3", "Normal homework")])
+    found, _ = b.scrape_courses({"assign-3": (time.time() + 86400, "todo")})  # had a deadline before: probably a glitch
+    assert found == []
+
+
+async def test_undated_first_sync_silent_then_new_ones_announced_silently(b, monkeypatch):
+    b.db.execute("DELETE FROM kv")
+    monkeypatch.setattr(b, "ECLASS_USERNAME", "u")
+    monkeypatch.setattr(b, "ECLASS_PASSWORD", "p")
+    state = [("assign-1", "Homework 2 <x>", COURSE, None, "https://e/1", "assign", "?")]
+    monkeypatch.setattr(b, "scrape_courses", lambda known: (state, []))
+    await b.sync_events()
+    assert b.sent == []  # first read only records
+    state.append(("assign-5", "Quiz 1", COURSE, None, "https://e/5", "assign", "todo"))
+    await b.sync_events()
+    assert len(b.sent) == 1 and "Quiz 1" in b.sent[0] and "Homework 2" not in b.sent[0]
+    assert b.sent_kw[0]["disable_notification"] is True and "📌" in b.sent[0]
+    await b.sync_events()
+    assert len(b.sent) == 1  # nothing repeats
+    assert b.db.execute("SELECT COUNT(*) FROM events").fetchone()[0] == 0  # never in the deadline tables
+
+
+async def test_undated_item_that_gets_a_deadline_moves_to_events(b, monkeypatch):
+    b.db.execute("DELETE FROM kv")
+    monkeypatch.setattr(b, "ECLASS_USERNAME", "u")
+    monkeypatch.setattr(b, "ECLASS_PASSWORD", "p")
+    state = [("assign-1", "HW", COURSE, None, "u", "assign", "?")]
+    monkeypatch.setattr(b, "scrape_courses", lambda known: (state, []))
+    await b.sync_events()
+    assert b.db.execute("SELECT COUNT(*) FROM undated").fetchone()[0] == 1
+    state[:] = [("assign-1", "HW", COURSE, int(time.time()) + 86400, "u", "assign", "todo")]
+    await b.sync_events()
+    assert b.db.execute("SELECT COUNT(*) FROM undated").fetchone()[0] == 0
+    assert b.db.execute("SELECT uid FROM events").fetchall() == [("assign-1",)]
+
+
+def test_undated_line_shows_submitted_state(b):
+    assert b.undated_line(("Homework 2 - X", COURSE, "https://e/1", "?")) == '📌 <a href="https://e/1">Homework 2 - X</a> · Electronic Circuit'
+    assert b.undated_line(("HW", COURSE, None, "done")).startswith("✅ HW")

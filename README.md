@@ -6,6 +6,7 @@ Telegram bot that tracks deadlines from eclass.inha.ac.kr (Moodle). Single file:
 
 - Logs in to eclass like a browser and reads every course page you're enrolled in every `POLL_MINUTES` (default 20): assignments and quizzes with their **deadline** and whether each is **submitted**. Alerts on **new** and **moved** deadlines.
   ✅ submitted · ❌ not yet · ❔ couldn't tell (e.g. "submit on Gradescope"). Submitted items get no reminders and are hidden from `/today` and `/week`.
+- **No deadline on eclass**: assignments and quizzes with no due date (e.g. work submitted on Gradescope, results placeholders) used to be invisible. They are listed by `/nodeadline` with 📌, and a new one is announced silently. They get no reminders; if one later gets a deadline it moves to the normal lists.
 - **Missed deadlines**: `/missed` lists items from the last 30 days whose deadline passed while still ❌. An unsubmitted item is re-read for 2 days after its deadline, so a last-minute or late submission is picked up and drops off the list. ❔ items are never called missed.
 - **`/done` and mute**: for something you handed in elsewhere (the ❔ items), tap ✅ on a reminder or in `/done [course or title]` and it counts as submitted everywhere: no reminders, hidden from `/today` and `/week`, never listed as missed. 🔕 only stops that item's reminders. Each press turns into an ↩️ undo button. Your choice survives refreshes.
 - **Inbox**: your eclass messages (feedback on your submissions, forum announcements, notes from teachers) and the all-courses Notice Board. 💬 feedback, 📢 announcements and 🚨 urgent notices (a message mentioning cancel / postponed / campus closed / 휴강 …) arrive with a notification; any other message arrives silently. `/inbox [word]` lists the latest 10. Only the two list pages are read (never the conversation pages), and each source's first read only records what is already there.
@@ -32,7 +33,7 @@ Quote the password in `.env` if it contains spaces or `#`. `.env` is mode 600 an
 
 ## Commands
 
-`/upcoming` next 15 · `/today` next 24 h · `/week` until the end of next Sunday (≥ 7 days, so next weekend is always included) · `/missed` passed unsubmitted · `/done [course]` mark handed in / mute · `/resources [course]` latest materials · `/grades [course]` your grades · `/attendance [course]` offline attendance · `/inbox [word]` messages and notices · `/sync` refresh now · `/help` explains everything (also shown by `/start`, with tap-able buttons; the same list is in Telegram's command menu)
+`/upcoming` next 15 · `/today` next 24 h · `/week` until the end of next Sunday (≥ 7 days, so next weekend is always included) · `/missed` passed unsubmitted · `/nodeadline` work with no deadline · `/done [course]` mark handed in / mute · `/resources [course]` latest materials · `/grades [course]` your grades · `/attendance [course]` offline attendance · `/inbox [word]` messages and notices · `/sync` refresh now · `/help` explains everything (also shown by `/start`, with tap-able buttons; the same list is in Telegram's command menu)
 
 Only the chat id in `.env` is answered.
 

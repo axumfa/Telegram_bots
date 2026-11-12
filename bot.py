@@ -53,7 +53,7 @@ REMINDERS = [
     ("7d", timedelta(days=7)),
 ]
 DATE_RE = r"(\d{4}-\d{2}-\d{2} \d{2}:\d{2})"
-ICON = {"done": "✅", "todo": "❌", "na": "📌", "?": "❔"}
+ICON = {"done": "✅", "todo": "❌", "na": "📌", "?": "❔"}  # na: no deadline on eclass
 ATT_STATUS = ("present", "absent", "late", "other")  # the mark's column on the attendance page, left to right
 ATT_ICON = {"present": "✅", "absent": "❌", "late": "🕒", "other": "📝", None: "⏳"}
 INBOX_ICON = {"feedback": "💬", "announcement": "📢", "urgent": "🚨", "message": "✉️"}
@@ -77,6 +77,7 @@ db.executescript(
     CREATE TABLE IF NOT EXISTS resources(uid TEXT PRIMARY KEY, title TEXT, course TEXT, kind TEXT, url TEXT, first_seen INTEGER);
     CREATE TABLE IF NOT EXISTS grades(uid TEXT PRIMARY KEY, course TEXT, item TEXT, grade TEXT, max TEXT, pct TEXT, kind TEXT, updated INTEGER);
     CREATE TABLE IF NOT EXISTS health(job TEXT PRIMARY KEY, last_ok INTEGER, last_err TEXT, fails INTEGER NOT NULL DEFAULT 0, alerted INTEGER NOT NULL DEFAULT 0);
+    CREATE TABLE IF NOT EXISTS undated(uid TEXT PRIMARY KEY, title TEXT, course TEXT, kind TEXT, url TEXT, status TEXT, first_seen INTEGER);
     CREATE TABLE IF NOT EXISTS kv(key TEXT PRIMARY KEY, value TEXT);
     CREATE TABLE IF NOT EXISTS inbox(uid TEXT PRIMARY KEY, kind TEXT, course TEXT, sender TEXT, ts TEXT, title TEXT, url TEXT, preview TEXT);
     CREATE TABLE IF NOT EXISTS attendance(uid TEXT PRIMARY KEY, course TEXT, day TEXT, cls TEXT, status TEXT);
@@ -274,6 +275,8 @@ def course_activities(cid, fallback_name):
 def scrape_courses(known):
     """known: {uid: (start_ts, status)} -> ([(uid, title, course, ts, url, kind, status)], [(uid, title, course, kind, url)]).
 
+    An item that never had a deadline (Gradescope tasks, results placeholders) comes back with ts None.
+
     Walks every course page; opens an activity only if it may still change (not done, and not long past).
     One failure doesn't stop the rest. Blocking.
     """
@@ -296,7 +299,7 @@ def scrape_courses(known):
             try:
                 page = web_get(url).text
                 ts = parse_due(kind, page)
-                if ts is not None:
+                if ts is not None or uid not in known:  # a known item whose page lost its date is probably a glitch
                     out.append((uid, title, course, ts, url, kind, parse_status(kind, page)))
             except Exception as e:
                 log.warning("%s failed: %s", uid, e)
@@ -561,7 +564,17 @@ async def sync_events():
     known = {r[0]: (r[1], r[2]) for r in db.execute("SELECT uid,start_ts,status FROM events")}
     found, resources = await asyncio.to_thread(scrape_courses, known)
     now = datetime.now(timezone.utc).timestamp()
+    first_undated = not db.execute("SELECT 1 FROM kv WHERE key='undated_seen'").fetchone()
+    new_undated = []
     for uid, title, course, ts, url, kind, status in found:
+        if ts is None:  # no deadline on eclass: listed by /nodeadline, never reminded about
+            if not db.execute("SELECT 1 FROM undated WHERE uid=?", (uid,)).fetchone():
+                db.execute("INSERT INTO undated VALUES(?,?,?,?,?,?,?)", (uid, title, course, kind, url, status, int(now)))
+                new_undated.append((uid, title, course, url, status))
+            else:
+                db.execute("UPDATE undated SET title=?, course=?, url=?, status=? WHERE uid=?", (title, course, url, status, uid))
+            continue
+        db.execute("DELETE FROM undated WHERE uid=?", (uid,))  # it got a deadline after all
         old = known.get(uid)
         db.execute(
             "INSERT INTO events(uid,title,course,start_ts,url,kind,status) VALUES(?,?,?,?,?,?,?) "
@@ -578,6 +591,11 @@ async def sync_events():
         elif old[0] != ts:
             db.execute("DELETE FROM reminded WHERE uid=?", (uid,))
             await bot.send_message(CHAT_ID, f"⚠️ moved (was {fmt_ts(old[0])})\n" + line(row))
+    db.execute("INSERT OR IGNORE INTO kv VALUES('undated_seen','1')")
+    if new_undated and not first_undated:
+        await bot.send_message(
+            CHAT_ID, "📌 <b>No deadline on eclass</b>\n" + "\n".join(undated_line(r[1:]) for r in new_undated), disable_notification=True
+        )
     new_res = []
     for row in resources:
         if not db.execute("SELECT 1 FROM resources WHERE uid=?", (row[0],)).fetchone():
@@ -586,6 +604,12 @@ async def sync_events():
     db.commit()
     if new_res and not first_res:
         await send_new_resources(new_res)
+
+
+def undated_line(row):
+    title, course, url, status = row
+    name = f'<a href="{esc(url)}">{esc(clean_title(title))}</a>' if url else esc(clean_title(title))
+    return f"{ICON['done'] if status == 'done' else ICON['na']} {name} · {esc(short_course(course))}"
 
 
 def res_line(row):
@@ -996,6 +1020,7 @@ MENU = [
     ("today", "Due in the next 24 hours"),
     ("week", "Due until the end of next Sunday"),
     ("missed", "Deadlines that passed unsubmitted"),
+    ("nodeadline", "Work eclass gives no deadline for"),
     ("done", "Mark something as handed in / mute it"),
     ("resources", "Latest course materials"),
     ("grades", "Your grades"),
@@ -1022,6 +1047,7 @@ HELP = (
     "/today — due in the next 24 hours\n"
     "/week — due until the end of next Sunday (so next weekend is included)\n"
     "/done — mark something you handed in elsewhere as done, or mute its reminders. Add a word to narrow it: <code>/done circuit</code>\n"
+    "/nodeadline — assignments and quizzes with no deadline on eclass (e.g. Gradescope work); new ones are announced silently\n"
     f"/missed — deadlines of the last {MISSED_DAYS} days that passed without a submission\n"
     "/resources — latest course materials (files, videos, links). "
     "Add a word to filter: <code>/resources database</code>\n"
@@ -1099,6 +1125,17 @@ async def on_action(q: CallbackQuery):
     ]
     await q.answer({"done": "Marked done ✅", "mute": "Muted 🔕", "undo": "Back to normal"}[action])
     await q.message.edit_reply_markup(reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+
+
+@dp.message(Command("nodeadline"))
+async def cmd_nodeadline(m: Message):
+    """Assignments and quizzes eclass gives no deadline for (e.g. work submitted on Gradescope)."""
+    rows = db.execute("SELECT title,course,url,status FROM undated ORDER BY (status = 'done'), course, title").fetchall()
+    await m.answer(
+        "<b>No deadline on eclass</b>\n" + "\n".join(undated_line(r) for r in rows)
+        if rows
+        else "Everything on eclass has a deadline"
+    )
 
 
 @dp.message(Command("missed"))
