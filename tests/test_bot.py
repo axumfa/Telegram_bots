@@ -1,6 +1,6 @@
 import asyncio
 import time
-from datetime import datetime
+from datetime import datetime, time as dtime
 from pathlib import Path
 
 import pytest
@@ -705,3 +705,78 @@ async def test_overlapping_cycles_do_not_share_a_cache(b, monkeypatch):
     gate.set()
     await first
     assert fake.calls == ["https://e/x", "https://e/x"]  # /sync really re-read the page
+
+
+# ---------- daily digest ----------
+def at(hhmm, day="2026-11-12"):
+    return datetime.strptime(f"{day} {hhmm}", "%Y-%m-%d %H:%M").replace(tzinfo=TZ)
+
+
+def add_at(b, uid, when, status="todo", override=None):
+    b.db.execute("INSERT INTO events(uid,title,course,start_ts,status,override) VALUES(?,?,?,?,?,?)",
+                 (uid, uid, COURSE, when.timestamp(), status, override))
+
+
+async def test_digest_is_off_by_default(b):
+    assert b.DIGEST_AT is None
+    add_at(b, "assign-1", at("20:00"))
+    await b.check_digest(now=at("08:01"))
+    assert b.sent == []
+
+
+async def test_digest_lists_today_and_tomorrow_only_unfinished_and_unmuted(b, monkeypatch):
+    monkeypatch.setattr(b, "DIGEST_AT", dtime(8, 0))
+    add_at(b, "today-todo", at("20:00"))
+    add_at(b, "tomorrow-unknown", at("10:00", "2026-11-13"), "?")
+    add_at(b, "done", at("21:00"), "done")
+    add_at(b, "marked-done", at("21:00"), "todo", "done")
+    add_at(b, "muted", at("21:00"), "todo", "mute")
+    add_at(b, "later", at("10:00", "2026-11-14"))  # day after tomorrow
+    add_at(b, "earlier-today", at("07:00"))  # already passed this morning
+    await b.check_digest(now=at("08:01"))
+    assert len(b.sent) == 1
+    msg = b.sent[0]
+    assert "today-todo" in msg and "tomorrow-unknown" in msg
+    for gone in ("done", "marked-done", "muted", "later", "earlier-today"):
+        assert gone not in msg.replace("Due today and tomorrow", "")
+    assert msg.index("Thu 12 Nov") < msg.index("Fri 13 Nov")
+
+
+async def test_digest_sent_once_a_day_and_not_when_nothing_is_due(b, monkeypatch):
+    monkeypatch.setattr(b, "DIGEST_AT", dtime(8, 0))
+    b.db.execute("DELETE FROM kv")
+    await b.check_digest(now=at("08:01"))
+    assert b.sent == []  # nothing due: silence
+    add_at(b, "assign-1", at("20:00"))
+    await b.check_digest(now=at("08:06"))
+    assert b.sent == []  # today's decision was already made
+    b.db.execute("UPDATE events SET start_ts=? WHERE uid='assign-1'", (at("20:00", "2026-11-13").timestamp(),))
+    await b.check_digest(now=at("08:01", "2026-11-13"))  # next morning: a new decision
+    assert len(b.sent) == 1 and "assign-1" in b.sent[0]
+    await b.check_digest(now=at("08:06", "2026-11-13"))
+    assert len(b.sent) == 1  # once a day
+
+
+async def test_digest_window_and_retry_after_a_failed_send(b, monkeypatch):
+    monkeypatch.setattr(b, "DIGEST_AT", dtime(8, 0))
+    b.db.execute("DELETE FROM kv")
+    add_at(b, "assign-1", at("20:00"))
+    await b.check_digest(now=at("07:55"))  # too early
+    await b.check_digest(now=at("11:30"))  # bot started too late for a morning summary
+    assert b.sent == []
+
+    real = b.bot.send_message
+
+    async def broken(*a, **k):
+        raise OSError("telegram down")
+
+    monkeypatch.setattr(b.bot, "send_message", broken)
+    with pytest.raises(OSError):
+        await b.check_digest(now=at("08:01"))
+    monkeypatch.setattr(b.bot, "send_message", real)
+    await b.check_digest(now=at("08:06"))  # the next tick tries again
+    assert len(b.sent) == 1
+
+
+def test_status_hides_digest_when_off(b):
+    assert "daily digest" not in b.render_status()

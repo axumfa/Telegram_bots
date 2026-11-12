@@ -5,7 +5,7 @@ import logging
 import os
 import re
 import sqlite3
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, time as dtime, timedelta, timezone
 from urllib.parse import urlparse
 from zoneinfo import ZoneInfo
 
@@ -36,6 +36,9 @@ POLL_MINUTES = int(os.getenv("POLL_MINUTES", "20"))
 GRADES_EVERY = 3  # check grades on every 3rd poll
 RECHECK_DAYS = 2  # keep re-reading an unsubmitted item this long after its deadline (last-minute and late submissions)
 MISSED_DAYS = 30  # /missed looks back this far
+_digest = os.getenv("DIGEST_TIME", "").strip()  # "08:00" sends a morning summary; empty = off
+DIGEST_AT = datetime.strptime(_digest, "%H:%M").time() if _digest else None
+DIGEST_WINDOW = timedelta(hours=3)  # a digest is only sent this long after DIGEST_TIME, never as a stale afternoon message
 SILENT_BEYOND_DAYS = 3  # a new deadline further away than this arrives without a sound
 FAIL_ALERT = 3  # consecutive failures of one job before the bot tells you
 TZ = ZoneInfo("Asia/Tashkent")
@@ -69,6 +72,7 @@ db.executescript(
     CREATE TABLE IF NOT EXISTS resources(uid TEXT PRIMARY KEY, title TEXT, course TEXT, kind TEXT, url TEXT, first_seen INTEGER);
     CREATE TABLE IF NOT EXISTS grades(uid TEXT PRIMARY KEY, course TEXT, item TEXT, grade TEXT, max TEXT, pct TEXT, kind TEXT, updated INTEGER);
     CREATE TABLE IF NOT EXISTS health(job TEXT PRIMARY KEY, last_ok INTEGER, last_err TEXT, fails INTEGER NOT NULL DEFAULT 0, alerted INTEGER NOT NULL DEFAULT 0);
+    CREATE TABLE IF NOT EXISTS kv(key TEXT PRIMARY KEY, value TEXT);
     CREATE TABLE IF NOT EXISTS attendance(uid TEXT PRIMARY KEY, course TEXT, day TEXT, cls TEXT, status TEXT);
     """
 )
@@ -593,6 +597,24 @@ def fmt_day(day):
     return datetime.strptime(day, "%Y-%m-%d").strftime("%a %d %b")
 
 
+async def check_digest(now=None):
+    """Once a day, shortly after DIGEST_TIME: what is due today and tomorrow. Nothing due: nothing is sent."""
+    if not DIGEST_AT:
+        return
+    now = now or datetime.now(TZ)
+    start = datetime.combine(now.date(), DIGEST_AT, tzinfo=TZ)
+    today = now.date().isoformat()
+    sent = db.execute("SELECT value FROM kv WHERE key='digest_sent'").fetchone()
+    if not (start <= now < start + DIGEST_WINDOW) or (sent and sent[0] == today):
+        return
+    d = now.date() + timedelta(days=2)
+    rows = upcoming(until=datetime(d.year, d.month, d.day, tzinfo=TZ).timestamp(), limit=30, hide_done=True, hide_muted=True, now=now.timestamp())
+    if rows:
+        await bot.send_message(CHAT_ID, "☀️ <b>Due today and tomorrow</b>\n\n" + render(rows))
+    db.execute("INSERT INTO kv VALUES('digest_sent',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (today,))
+    db.commit()  # marked only after a successful send, so a Telegram hiccup is retried on the next tick
+
+
 async def sync_attendance():
     """Pull offline attendance from eclass; alert when a class is marked absent, late or other (first run only records)."""
     if not (ECLASS_USERNAME and ECLASS_PASSWORD):
@@ -620,6 +642,7 @@ JOB_LABEL = {
     "sync_attendance": "attendance",
     "sync_grades": "grades",
     "check_reminders": "reminders",
+    "check_digest": "daily digest",
 }
 
 
@@ -691,6 +714,8 @@ async def poll_loop():
 async def reminder_loop():
     while True:
         await run_job(check_reminders)
+        if DIGEST_AT:
+            await run_job(check_digest)
         await asyncio.sleep(300)
 
 
@@ -702,8 +727,8 @@ def week_end(now):
     return datetime(d.year, d.month, d.day, tzinfo=TZ).timestamp()
 
 
-def upcoming(days=None, limit=15, hide_done=False, until=None, match=None):
-    now = datetime.now(timezone.utc).timestamp()
+def upcoming(days=None, limit=15, hide_done=False, until=None, match=None, hide_muted=False, now=None):
+    now = now if now is not None else datetime.now(timezone.utc).timestamp()
     q, args = f"SELECT {COLS} FROM events WHERE start_ts > ?", [now]
     if days is not None:
         until = now + days * 86400
@@ -712,6 +737,8 @@ def upcoming(days=None, limit=15, hide_done=False, until=None, match=None):
         args.append(until)
     if hide_done:
         q += f" AND COALESCE({STATUS},'') != 'done'"
+    if hide_muted:
+        q += " AND COALESCE(override,'') != 'mute'"
     if match:
         q += " AND (course LIKE ? ESCAPE '\\' OR title LIKE ? ESCAPE '\\')"
         args += [like(match)] * 2
@@ -748,6 +775,8 @@ def render_status():
     out = ["🩺 <b>Status</b>"]
     for name, label in JOB_LABEL.items():
         if name not in health:
+            if name == "check_digest" and not DIGEST_AT:
+                continue  # switched off
             out.append(f"⏳ {label} · not run yet")
             continue
         last_ok, err, fails = health[name]
@@ -871,6 +900,7 @@ HELP = (
     "⏰ reminder 7 days, 3 days, 1 day, 6 hours and 1 hour before a deadline (not for submitted work). "
     "Its buttons: ✅ done · 🔕 mute · ↩️ undo\n"
     "📚 new course material\n"
+    "☀️ a morning summary of what is due today and tomorrow, if you turned it on (nothing due: no message)\n"
     "📊 new or changed grade (checked every third refresh)\n"
     "🗓 a class marked absent, late or other\n"
     "⚠️ a check keeps failing (eclass changed, wrong password…) · ✅ it works again\n"
