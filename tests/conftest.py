@@ -6,7 +6,6 @@ os.environ.update(
     BOT_TOKEN="123456:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
     CHAT_ID="1",
     DB_PATH=":memory:",
-    MOODLE_TOKEN="",
     ECLASS_USERNAME="",
     ECLASS_PASSWORD="",
 )

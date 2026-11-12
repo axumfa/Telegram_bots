@@ -8,7 +8,6 @@ from datetime import datetime, timedelta, timezone
 from urllib.parse import urlparse
 from zoneinfo import ZoneInfo
 
-import aiohttp
 import requests
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
@@ -30,13 +29,13 @@ load_dotenv()
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 CHAT_ID = int(os.environ["CHAT_ID"])
 MOODLE_URL = os.getenv("MOODLE_URL", "https://eclass.inha.ac.kr").rstrip("/")
-MOODLE_TOKEN = os.getenv("MOODLE_TOKEN", "")  # optional: enables announcements
 ECLASS_USERNAME = os.getenv("ECLASS_USERNAME", "")
 ECLASS_PASSWORD = os.getenv("ECLASS_PASSWORD", "")
 POLL_MINUTES = int(os.getenv("POLL_MINUTES", "20"))
 GRADES_EVERY = 3  # check grades on every 3rd poll
 RECHECK_DAYS = 2  # keep re-reading an unsubmitted item this long after its deadline (last-minute and late submissions)
 MISSED_DAYS = 30  # /missed looks back this far
+SILENT_BEYOND_DAYS = 3  # a new deadline further away than this arrives without a sound
 FAIL_ALERT = 3  # consecutive failures of one job before the bot tells you
 TZ = ZoneInfo("Asia/Tashkent")
 UA = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:130.0) Gecko/20100101 Firefox/130.0"}
@@ -66,7 +65,6 @@ db.executescript(
     """
     CREATE TABLE IF NOT EXISTS events(uid TEXT PRIMARY KEY, title TEXT, course TEXT, start_ts INTEGER);
     CREATE TABLE IF NOT EXISTS reminded(uid TEXT, label TEXT, PRIMARY KEY(uid, label));
-    CREATE TABLE IF NOT EXISTS news(id TEXT PRIMARY KEY);
     CREATE TABLE IF NOT EXISTS resources(uid TEXT PRIMARY KEY, title TEXT, course TEXT, kind TEXT, url TEXT, first_seen INTEGER);
     CREATE TABLE IF NOT EXISTS grades(uid TEXT PRIMARY KEY, course TEXT, item TEXT, grade TEXT, max TEXT, pct TEXT, kind TEXT, updated INTEGER);
     CREATE TABLE IF NOT EXISTS health(job TEXT PRIMARY KEY, last_ok INTEGER, last_err TEXT, fails INTEGER NOT NULL DEFAULT 0, alerted INTEGER NOT NULL DEFAULT 0);
@@ -85,6 +83,11 @@ bot = Bot(
 )
 dp = Dispatcher()
 dp.message.filter(F.chat.id == CHAT_ID)  # only you
+
+
+def like(word):
+    """LIKE pattern for 'contains word', with %, _ and \\ in the word taken literally (use with ESCAPE '\\')."""
+    return "%" + re.sub(r"([\\%_])", r"\\\1", word.strip()) + "%"
 
 
 def esc(s):
@@ -141,17 +144,6 @@ def render(rows):
             day = d
         out.append(line(r, date=False))
     return "\n".join(out)
-
-
-# ---------- announcements (Moodle web service) ----------
-async def ws(fn, **params):
-    params.update(wstoken=MOODLE_TOKEN, wsfunction=fn, moodlewsrestformat="json")
-    async with aiohttp.ClientSession() as s:
-        async with s.post(f"{MOODLE_URL}/webservice/rest/server.php", data=params) as r:
-            data = await r.json(content_type=None)
-    if isinstance(data, dict) and data.get("exception"):
-        raise RuntimeError(data.get("message"))
-    return data
 
 
 # ---------- eclass web session (username/password) ----------
@@ -268,9 +260,9 @@ def scrape_courses(known):
     for cid, fallback in list_courses().items():
         try:
             course, acts, res = course_activities(cid, fallback)
+        except RuntimeError:
+            raise
         except Exception as e:
-            if isinstance(e, RuntimeError):
-                raise
             log.warning("course %s failed: %s", cid, e)
             continue
         resources += [(f"{kind}-{mid}", title, course, kind, url) for kind, mid, title, url in res]
@@ -377,9 +369,9 @@ def scrape_grades():
     """
     try:
         overview = parse_overview(web_get(f"{MOODLE_URL}/grade/report/overview/index.php").text)
+    except RuntimeError:
+        raise
     except Exception as e:
-        if isinstance(e, RuntimeError):
-            raise
         log.warning("grades overview failed: %s", e)
         overview = {}
     out = {}
@@ -401,9 +393,9 @@ def scrape_grades():
                 elif cid in overview:
                     name, total = overview[cid]
                     out[cid] = (name, [("Course total", total, None, None, "total")])
+        except RuntimeError:
+            raise
         except Exception as e:
-            if isinstance(e, RuntimeError):
-                raise
             log.warning("grades of course %s failed: %s", cid, e)
     return out
 
@@ -439,9 +431,9 @@ def scrape_attendance():
         try:
             name, rows = parse_attendance(web_get(f"{MOODLE_URL}/local/ubattendance/my_status.php?id={cid}").text)
             out[cid] = (name or fallback, rows)
+        except RuntimeError:
+            raise
         except Exception as e:
-            if isinstance(e, RuntimeError):
-                raise
             log.warning("attendance of course %s failed: %s", cid, e)
     return out
 
@@ -470,7 +462,8 @@ async def sync_events():
             continue
         row = (uid, title, course, ts, url, status)
         if old is None:
-            await bot.send_message(CHAT_ID, "🆕 " + line(row))
+            far = ts - now > SILENT_BEYOND_DAYS * 86400
+            await bot.send_message(CHAT_ID, "🆕 " + line(row), disable_notification=far)
         elif old[0] != ts:
             db.execute("DELETE FROM reminded WHERE uid=?", (uid,))
             await bot.send_message(CHAT_ID, f"⚠️ moved (was {fmt_ts(old[0])})\n" + line(row))
@@ -503,7 +496,7 @@ def render_resources(rows):
 
 async def send_new_resources(rows):
     for i in range(0, len(rows), 25):  # stay under Telegram's message size limit
-        await bot.send_message(CHAT_ID, "📚 <b>New material</b>\n\n" + render_resources(rows[i : i + 25]))
+        await bot.send_message(CHAT_ID, "📚 <b>New material</b>\n\n" + render_resources(rows[i : i + 25]), disable_notification=True)
 
 
 def item_row(uid, title, state=None):
@@ -549,36 +542,6 @@ async def check_reminders():
         )
 
 
-async def sync_news():
-    """Course announcements via Moodle web service (needs MOODLE_TOKEN)."""
-    if not MOODLE_TOKEN:
-        return
-    first_run = db.execute("SELECT COUNT(*) FROM news").fetchone()[0] == 0
-    info = await ws("core_webservice_get_site_info")
-    courses = await ws("core_enrol_get_users_courses", userid=info["userid"])
-    ids = {c["id"]: c["shortname"] for c in courses}
-    if not ids:
-        return
-    params = {f"courseids[{i}]": cid for i, cid in enumerate(ids)}
-    forums = await ws("mod_forum_get_forums_by_courses", **params)
-    for f in forums:
-        if f.get("type") != "news":
-            continue
-        res = await ws("mod_forum_get_forum_discussions", forumid=f["id"], perpage=10)
-        for d in res.get("discussions", []):
-            key = f"d{d['id']}"
-            if db.execute("SELECT 1 FROM news WHERE id=?", (key,)).fetchone():
-                continue
-            db.execute("INSERT INTO news VALUES(?)", (key,))
-            if not first_run:
-                await bot.send_message(
-                    CHAT_ID,
-                    f"📢 <b>{esc(ids.get(f['course']))}</b>\n{esc(d.get('name'))}\n"
-                    f"{MOODLE_URL}/mod/forum/discuss.php?d={d['discussion']}",
-                )
-    db.commit()
-
-
 def grade_text(grade, mx, pct):
     """'85/100 (85.00%)', '85', or '—' when not graded."""
     if grade is None:
@@ -611,7 +574,7 @@ async def sync_grades():
             alerts.append(f"• <b>{esc(item)}</b> · {esc(short_course(course))} · {esc(grade_text(grade, mx, pct))}{was}")
     db.commit()
     for i in range(0, len(alerts), 25):  # stay under Telegram's message size limit
-        await bot.send_message(CHAT_ID, "📊 <b>New grades</b>\n\n" + "\n".join(alerts[i : i + 25]))
+        await bot.send_message(CHAT_ID, "📊 <b>New grades</b>\n\n" + "\n".join(alerts[i : i + 25]), disable_notification=True)
 
 
 def fmt_day(day):
@@ -642,17 +605,16 @@ async def sync_attendance():
 
 JOB_LABEL = {
     "sync_events": "deadlines",
-    "sync_news": "announcements",
     "sync_attendance": "attendance",
     "sync_grades": "grades",
     "check_reminders": "reminders",
 }
 
 
-async def notify(text):
+async def notify(text, silent=False):
     """Send a message to you; a Telegram hiccup is logged, never raised (it must not kill a loop)."""
     try:
-        await bot.send_message(CHAT_ID, text)
+        await bot.send_message(CHAT_ID, text, disable_notification=silent)
     except Exception:
         log.exception("could not send message")
 
@@ -689,14 +651,14 @@ async def run_job(job, alert=True):
     )
     db.commit()
     if alerted and alert:
-        await notify(f"✅ <b>{esc(label)}</b> is updating again")
+        await notify(f"✅ <b>{esc(label)}</b> is updating again", silent=True)
     return None
 
 
 async def poll_loop():
     polls = 0
     while True:
-        jobs = [sync_events, sync_news, sync_attendance] + ([sync_grades] if polls % GRADES_EVERY == 0 else [])
+        jobs = [sync_events, sync_attendance] + ([sync_grades] if polls % GRADES_EVERY == 0 else [])
         polls += 1
         for job in jobs:
             await run_job(job)
@@ -728,8 +690,8 @@ def upcoming(days=None, limit=15, hide_done=False, until=None, match=None):
     if hide_done:
         q += f" AND COALESCE({STATUS},'') != 'done'"
     if match:
-        q += " AND (course LIKE ? OR title LIKE ?)"
-        args += [f"%{match}%"] * 2
+        q += " AND (course LIKE ? ESCAPE '\\' OR title LIKE ? ESCAPE '\\')"
+        args += [like(match)] * 2
     return db.execute(q + " ORDER BY start_ts LIMIT ?", args + [limit]).fetchall()
 
 
@@ -956,8 +918,8 @@ async def cmd_resources(m: Message, command: CommandObject):
     """Latest course materials (no submission needed); '/resources database' filters by course or title."""
     q, args = "SELECT uid,title,course,kind,url FROM resources", []
     if command.args:
-        q += " WHERE course LIKE ? OR title LIKE ?"
-        args = [f"%{command.args.strip()}%"] * 2
+        q += " WHERE course LIKE ? ESCAPE '\\' OR title LIKE ? ESCAPE '\\'"
+        args = [like(command.args)] * 2
     # module ids grow over time, so a bigger id means added later
     rows = db.execute(q + " ORDER BY first_seen DESC, CAST(substr(uid, instr(uid,'-')+1) AS INTEGER) DESC LIMIT 15", args).fetchall()
     rows.sort(key=lambda r: r[2])  # group by course (stable, keeps newest-first inside each)
@@ -969,8 +931,8 @@ async def cmd_grades(m: Message, command: CommandObject):
     """Course totals; '/grades database' shows the graded items of matching courses."""
     q, args = "SELECT course,item,grade,max,pct,kind FROM grades", []
     if command.args:
-        q += " WHERE course LIKE ?"
-        args = [f"%{command.args.strip()}%"]
+        q += " WHERE course LIKE ? ESCAPE '\\'"
+        args = [like(command.args)]
     rows = db.execute(q, args).fetchall()
     if not rows:
         await m.answer("No grades found — try /sync first" if not command.args else "No course matches that")
@@ -983,8 +945,8 @@ async def cmd_attendance(m: Message, command: CommandObject):
     """Offline attendance, only for courses that have it; '/attendance word' lists every class of matching courses."""
     q, args = "SELECT course,day,cls,status FROM attendance", []
     if command.args:
-        q += " WHERE course LIKE ?"
-        args = [f"%{command.args.strip()}%"]
+        q += " WHERE course LIKE ? ESCAPE '\\'"
+        args = [like(command.args)]
     rows = db.execute(q, args).fetchall()
     if not rows:
         await m.answer("No course matches that" if command.args else "No course has offline attendance yet — try /sync first")
@@ -995,7 +957,7 @@ async def cmd_attendance(m: Message, command: CommandObject):
 @dp.message(Command("sync"))
 async def cmd_sync(m: Message):
     failed = []
-    for job in (sync_events, sync_news, sync_grades, sync_attendance):  # one failing job doesn't stop the others
+    for job in (sync_events, sync_grades, sync_attendance):  # one failing job doesn't stop the others
         err = await run_job(job, alert=False)
         if err:
             failed.append(f"{JOB_LABEL[job.__name__]}: {esc(err) or type(err).__name__}")

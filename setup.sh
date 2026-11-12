@@ -27,7 +27,6 @@ print(r[-1]['message']['chat']['id'] if r else '')")
   cat > .env <<EOF
 BOT_TOKEN=${TOKEN}
 CHAT_ID=${CHAT_ID}
-MOODLE_TOKEN=
 ECLASS_USERNAME=${EUSER}
 ECLASS_PASSWORD=${EPASS}
 POLL_MINUTES=20

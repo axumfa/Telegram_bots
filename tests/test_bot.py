@@ -236,7 +236,7 @@ async def test_failed_course_keeps_old_grades(b, monkeypatch):
 
 
 async def test_grades_checked_every_third_poll(b, monkeypatch):
-    calls = {"events": 0, "news": 0, "attendance": 0, "grades": 0}
+    calls = {"events": 0, "attendance": 0, "grades": 0}
 
     def counter(name):
         async def job():
@@ -256,7 +256,7 @@ async def test_grades_checked_every_third_poll(b, monkeypatch):
     monkeypatch.setattr(b.asyncio, "sleep", fake_sleep)
     with pytest.raises(asyncio.CancelledError):
         await b.poll_loop()
-    assert calls == {"events": 7, "news": 7, "attendance": 7, "grades": 3}  # polls 1, 4 and 7
+    assert calls == {"events": 7, "attendance": 7, "grades": 3}  # polls 1, 4 and 7
 
 
 # ---------- grades from assignment / quiz pages (courses that hide their gradebook) ----------
@@ -613,3 +613,42 @@ def test_upcoming_match_filters_course_or_title(b):
     add_event(b, "quiz-2", 1, "todo")
     assert [r[0] for r in b.upcoming(match="circuit")] == ["assign-1", "quiz-2"]  # course name
     assert [r[0] for r in b.upcoming(match="quiz-2")] == ["quiz-2"]
+
+
+# ---------- quiet vs. loud messages ----------
+async def test_low_urgency_messages_are_silent_and_urgent_ones_are_not(b, monkeypatch):
+    await b.send_new_resources([("ubfile-1", "L1", COURSE, "ubfile", "https://e/1")])
+    assert b.sent_kw[-1]["disable_notification"] is True
+
+    b.db.execute("DELETE FROM grades")
+    state = {"1": ("C[001]", [("Quiz 1", None, "10", None, "item")])}
+    monkeypatch.setattr(b, "ECLASS_USERNAME", "u")
+    monkeypatch.setattr(b, "ECLASS_PASSWORD", "p")
+    monkeypatch.setattr(b, "scrape_grades", lambda: state)
+    await b.sync_grades()
+    state["1"] = ("C[001]", [("Quiz 1", "9", "10", None, "item")])
+    await b.sync_grades()
+    assert "New grades" in b.sent[-1] and b.sent_kw[-1]["disable_notification"] is True
+
+    await b.run_job(failing(RuntimeError("x")))  # a failing check is urgent
+    assert b.sent_kw[-1]["disable_notification"] is False
+    await b.run_job(working())
+    assert "updating again" in b.sent[-1] and b.sent_kw[-1]["disable_notification"] is True
+
+
+async def test_new_deadline_is_silent_only_when_far_away(b, monkeypatch):
+    monkeypatch.setattr(b, "ECLASS_USERNAME", "u")
+    monkeypatch.setattr(b, "ECLASS_PASSWORD", "p")
+    now = int(time.time())
+    b.db.execute("INSERT INTO events(uid,title,course,start_ts,status) VALUES('assign-0','seed',?,?,'todo')", (COURSE, now + 99))  # not a first run
+    found = [("assign-1", "Soon", COURSE, now + 86400, "u", "assign", "todo"), ("assign-2", "Later", COURSE, now + 10 * 86400, "u", "assign", "todo")]
+    monkeypatch.setattr(b, "scrape_courses", lambda known: (found, []))
+    await b.sync_events()
+    assert [kw["disable_notification"] for kw in b.sent_kw] == [False, True]  # Soon pings, Later doesn't
+
+
+def test_like_takes_wildcards_literally(b):
+    assert b.like(" 50% off_x ") == "%50\\% off\\_x%"
+    for title, word, hit in [("100% done", "100%", True), ("1000 done", "100%", False), ("a_b", "a_b", True), ("axb", "a_b", False)]:
+        row = b.db.execute("SELECT ? LIKE ? ESCAPE '\\'", (title, b.like(word))).fetchone()[0]
+        assert bool(row) is hit
