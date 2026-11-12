@@ -92,7 +92,7 @@ async def test_new_resources_announced_once(b, monkeypatch):
 
 def test_menu_matches_handlers(b):
     cmds = {c for c, _ in b.MENU}
-    assert cmds == {"upcoming", "today", "week", "resources", "grades", "attendance", "sync", "help"}
+    assert cmds == {"upcoming", "today", "week", "resources", "grades", "attendance", "sync", "status", "help"}
     assert all(len(d) <= 256 for _, d in b.MENU)
     assert "<course>" not in b.HELP  # raw angle brackets would break Telegram's HTML parsing
 
@@ -431,3 +431,71 @@ async def test_attendance_only_stores_courses_with_classes_and_keeps_failed_ones
     monkeypatch.setattr(b, "scrape_attendance", lambda: {})  # every course failed this time
     await b.sync_attendance()
     assert b.db.execute("SELECT COUNT(*) FROM attendance").fetchone()[0] == 1
+
+
+# ---------- health ----------
+def failing(exc):
+    async def job():
+        raise exc
+    job.__name__ = "sync_grades"
+    return job
+
+
+def working():
+    async def job():
+        pass
+    job.__name__ = "sync_grades"
+    return job
+
+
+async def test_transient_failures_alert_once_after_three_then_recovery(b):
+    job = failing(ValueError("boom"))
+    for _ in range(2):
+        assert isinstance(await b.run_job(job), ValueError)
+    assert b.sent == []  # a hiccup or two is not worth a message
+    await b.run_job(job)
+    assert len(b.sent) == 1 and "grades" in b.sent[0] and "boom" in b.sent[0]
+    await b.run_job(job)
+    await b.run_job(job)
+    assert len(b.sent) == 1  # still failing: no repeat
+    assert await b.run_job(working()) is None
+    assert len(b.sent) == 2 and "updating again" in b.sent[1]
+    await b.run_job(working())
+    assert len(b.sent) == 2
+
+
+async def test_login_style_error_alerts_at_once(b):
+    await b.run_job(failing(RuntimeError("eclass login failed")))
+    assert len(b.sent) == 1 and "login failed" in b.sent[0]
+
+
+async def test_run_job_without_alert_stays_quiet_but_counts(b):
+    for _ in range(4):
+        await b.run_job(failing(RuntimeError("x")), alert=False)
+    assert b.sent == []
+    await b.run_job(failing(RuntimeError("x")))  # the next background failure still alerts
+    assert len(b.sent) == 1
+
+
+async def test_telegram_failure_does_not_escape_run_job(b, monkeypatch):
+    async def broken(*a, **k):
+        raise OSError("telegram down")
+    monkeypatch.setattr(b.bot, "send_message", broken)
+    assert isinstance(await b.run_job(failing(RuntimeError("x"))), RuntimeError)
+
+
+async def test_status_shows_ok_failing_and_not_run(b):
+    await b.run_job(working())
+    out = b.render_status()
+    assert "✅ grades · last ok just now" in out and "⏳ deadlines · not run yet" in out
+    await b.run_job(failing(ValueError("boom <b>")), alert=False)
+    out = b.render_status()
+    assert "❌ grades · failing ×1" in out and "boom &lt;b&gt;" in out
+
+
+def test_empty_home_page_is_an_error(b, monkeypatch):
+    class R:
+        text = "<html><body>nothing here</body></html>"
+    monkeypatch.setattr(b, "web_get", lambda url, **kw: R)
+    with pytest.raises(RuntimeError, match="no courses"):
+        b.list_courses()

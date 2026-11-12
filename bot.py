@@ -27,6 +27,7 @@ ECLASS_USERNAME = os.getenv("ECLASS_USERNAME", "")
 ECLASS_PASSWORD = os.getenv("ECLASS_PASSWORD", "")
 POLL_MINUTES = int(os.getenv("POLL_MINUTES", "20"))
 GRADES_EVERY = 3  # check grades on every 3rd poll
+FAIL_ALERT = 3  # consecutive failures of one job before the bot tells you
 TZ = ZoneInfo("Asia/Tashkent")
 UA = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:130.0) Gecko/20100101 Firefox/130.0"}
 # smallest first
@@ -56,6 +57,7 @@ db.executescript(
     CREATE TABLE IF NOT EXISTS news(id TEXT PRIMARY KEY);
     CREATE TABLE IF NOT EXISTS resources(uid TEXT PRIMARY KEY, title TEXT, course TEXT, kind TEXT, url TEXT, first_seen INTEGER);
     CREATE TABLE IF NOT EXISTS grades(uid TEXT PRIMARY KEY, course TEXT, item TEXT, grade TEXT, max TEXT, pct TEXT, kind TEXT, updated INTEGER);
+    CREATE TABLE IF NOT EXISTS health(job TEXT PRIMARY KEY, last_ok INTEGER, last_err TEXT, fails INTEGER NOT NULL DEFAULT 0, alerted INTEGER NOT NULL DEFAULT 0);
     CREATE TABLE IF NOT EXISTS attendance(uid TEXT PRIMARY KEY, course TEXT, day TEXT, cls TEXT, status TEXT);
     """
 )
@@ -217,6 +219,8 @@ def list_courses():
     ids = {}
     for a in soup.find_all("a", href=re.compile(r"course/view\.php\?id=\d+")):
         ids.setdefault(re.search(r"id=(\d+)", a["href"]).group(1), a.get_text(" ", strip=True))
+    if not ids:  # logged in but nothing listed: eclass changed its page (or you have no courses)
+        raise RuntimeError("no courses found on the eclass home page")
     return ids
 
 
@@ -431,12 +435,8 @@ def scrape_attendance():
 
 
 # ---------- sync jobs ----------
-_login_alerted = False
-
-
 async def sync_events():
     """Pull deadlines and submission status from the course pages; alert on new and moved ones."""
-    global _login_alerted
     if not (ECLASS_USERNAME and ECLASS_PASSWORD):
         raise RuntimeError("ECLASS_USERNAME / ECLASS_PASSWORD not set")
     # drop rows from the old iCal-based versions (their uids don't look like 'assign-123')
@@ -444,14 +444,7 @@ async def sync_events():
     first_run = db.execute("SELECT COUNT(*) FROM events").fetchone()[0] == 0
     first_res = db.execute("SELECT COUNT(*) FROM resources").fetchone()[0] == 0
     known = {r[0]: (r[1], r[2]) for r in db.execute("SELECT uid,start_ts,status FROM events")}
-    try:
-        found, resources = await asyncio.to_thread(scrape_courses, known)
-    except RuntimeError as e:
-        if not _login_alerted:
-            _login_alerted = True
-            await bot.send_message(CHAT_ID, f"⚠️ {esc(e)}")
-        raise
-    _login_alerted = False
+    found, resources = await asyncio.to_thread(scrape_courses, known)
     now = datetime.now(timezone.utc).timestamp()
     for uid, title, course, ts, url, kind, status in found:
         old = known.get(uid)
@@ -616,25 +609,72 @@ async def sync_attendance():
         await bot.send_message(CHAT_ID, "🗓 <b>Attendance</b>\n\n" + "\n".join(alerts[i : i + 25]))
 
 
+JOB_LABEL = {
+    "sync_events": "deadlines",
+    "sync_news": "announcements",
+    "sync_attendance": "attendance",
+    "sync_grades": "grades",
+    "check_reminders": "reminders",
+}
+
+
+async def notify(text):
+    """Send a message to you; a Telegram hiccup is logged, never raised (it must not kill a loop)."""
+    try:
+        await bot.send_message(CHAT_ID, text)
+    except Exception:
+        log.exception("could not send message")
+
+
+async def run_job(job, alert=True):
+    """Run one job and record its health. Returns the exception, or None on success.
+
+    Tells you once when a job has failed FAIL_ALERT times in a row (a RuntimeError, i.e. a wrong login or an
+    eclass page that changed, right away) and once when it works again. alert=False is for /sync, which
+    reports to you itself.
+    """
+    name, now = job.__name__, int(datetime.now(timezone.utc).timestamp())
+    fails, alerted = db.execute("SELECT fails, alerted FROM health WHERE job=?", (name,)).fetchone() or (0, 0)
+    label = JOB_LABEL.get(name, name)
+    try:
+        await job()
+    except Exception as e:
+        log.exception("%s failed", name)
+        fails += 1
+        send = alert and not alerted and (fails >= FAIL_ALERT or isinstance(e, RuntimeError))
+        db.execute(
+            "INSERT INTO health(job,last_err,fails,alerted) VALUES(?,?,?,?) "
+            "ON CONFLICT(job) DO UPDATE SET last_err=excluded.last_err, fails=excluded.fails, alerted=excluded.alerted",
+            (name, str(e) or type(e).__name__, fails, int(alerted or send)),
+        )
+        db.commit()
+        if send:
+            await notify(f"⚠️ <b>{esc(label)}</b> isn't updating: {esc(e) or type(e).__name__}")
+        return e
+    db.execute(
+        "INSERT INTO health(job,last_ok,fails,alerted) VALUES(?,?,0,0) "
+        "ON CONFLICT(job) DO UPDATE SET last_ok=excluded.last_ok, last_err=NULL, fails=0, alerted=0",
+        (name, now),
+    )
+    db.commit()
+    if alerted and alert:
+        await notify(f"✅ <b>{esc(label)}</b> is updating again")
+    return None
+
+
 async def poll_loop():
     polls = 0
     while True:
         jobs = [sync_events, sync_news, sync_attendance] + ([sync_grades] if polls % GRADES_EVERY == 0 else [])
         polls += 1
         for job in jobs:
-            try:
-                await job()
-            except Exception:
-                log.exception("%s failed", job.__name__)
+            await run_job(job)
         await asyncio.sleep(POLL_MINUTES * 60)
 
 
 async def reminder_loop():
     while True:
-        try:
-            await check_reminders()
-        except Exception:
-            log.exception("reminders failed")
+        await run_job(check_reminders)
         await asyncio.sleep(300)
 
 
@@ -661,6 +701,36 @@ def upcoming(days=None, limit=15, hide_done=False, until=None):
 
 async def reply_list(m: Message, rows, empty):
     await m.answer(render(rows) if rows else empty)
+
+
+def ago(ts):
+    secs = max(0, int(datetime.now(timezone.utc).timestamp()) - ts)
+    if secs < 90:
+        return "just now"
+    if secs < 5400:
+        return f"{round(secs / 60)} min ago"
+    if secs < 172800:
+        return f"{round(secs / 3600)} h ago"
+    return f"{secs // 86400} d ago"
+
+
+def render_status():
+    """One line per job (last success, or how it's failing) and how much data is stored."""
+    health = {r[0]: r[1:] for r in db.execute("SELECT job,last_ok,last_err,fails FROM health")}
+    out = ["🩺 <b>Status</b>"]
+    for name, label in JOB_LABEL.items():
+        if name not in health:
+            out.append(f"⏳ {label} · not run yet")
+            continue
+        last_ok, err, fails = health[name]
+        when = f"last ok {ago(last_ok)}" if last_ok else "never worked"
+        if fails:
+            out.append(f"❌ {label} · failing ×{fails} · {when}\n    <i>{esc(err)[:200]}</i>")
+        else:
+            out.append(f"✅ {label} · {when}")
+    counts = [(t, db.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]) for t in ("events", "resources", "grades", "attendance")]
+    out.append("\n" + " · ".join(f"{n} {t}" for t, n in counts))
+    return "\n".join(out)
 
 
 def render_grades(rows, detail):
@@ -735,6 +805,7 @@ MENU = [
     ("grades", "Your grades"),
     ("attendance", "Your offline attendance"),
     ("sync", "Refresh from eclass now"),
+    ("status", "Is the bot working?"),
     ("help", "What this bot does"),
 ]
 KEYBOARD = ReplyKeyboardMarkup(
@@ -756,7 +827,8 @@ HELP = (
     "Add a word to filter: <code>/resources database</code>\n"
     "/grades — your course totals. Add a word for the details of one course: <code>/grades database</code>\n"
     "/attendance — offline attendance of the courses that have it. Add a word for every class of one course: <code>/attendance operating</code>\n"
-    "/sync — check eclass right now\n\n"
+    "/sync — check eclass right now\n"
+    "/status — when each check last worked, and whether anything is failing\n\n"
     "<b>Icons</b>\n"
     "❌ not submitted yet · ✅ submitted · ❔ can't tell (e.g. submitted elsewhere)\n"
     "📄 file · 🎥 video · 📁 folder · 🔗 link · 📝 page\n"
@@ -767,6 +839,7 @@ HELP = (
     "📚 new course material\n"
     "📊 new or changed grade (checked every third refresh)\n"
     "🗓 a class marked absent, late or other\n"
+    "⚠️ a check keeps failing (eclass changed, wrong password…) · ✅ it works again\n"
     "Tap a title to open it on eclass."
 )
 
@@ -835,14 +908,17 @@ async def cmd_attendance(m: Message, command: CommandObject):
 
 @dp.message(Command("sync"))
 async def cmd_sync(m: Message):
-    try:
-        await sync_events()
-        await sync_news()
-        await sync_grades()
-        await sync_attendance()
-        await m.answer("Synced ✅")
-    except Exception as e:
-        await m.answer(f"Sync failed: {esc(e)}")
+    failed = []
+    for job in (sync_events, sync_news, sync_grades, sync_attendance):  # one failing job doesn't stop the others
+        err = await run_job(job, alert=False)
+        if err:
+            failed.append(f"{JOB_LABEL[job.__name__]}: {esc(err) or type(err).__name__}")
+    await m.answer("Synced ✅" if not failed else "Synced, but:\n" + "\n".join(failed))
+
+
+@dp.message(Command("status"))
+async def cmd_status(m: Message):
+    await m.answer(render_status())
 
 
 async def main():
