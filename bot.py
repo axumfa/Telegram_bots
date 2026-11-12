@@ -1,5 +1,6 @@
 import asyncio
 import contextvars
+import hashlib
 import html
 import logging
 import os
@@ -55,6 +56,10 @@ DATE_RE = r"(\d{4}-\d{2}-\d{2} \d{2}:\d{2})"
 ICON = {"done": "✅", "todo": "❌", "na": "📌", "?": "❔"}
 ATT_STATUS = ("present", "absent", "late", "other")  # the mark's column on the attendance page, left to right
 ATT_ICON = {"present": "✅", "absent": "❌", "late": "🕒", "other": "📝", None: "⏳"}
+INBOX_ICON = {"feedback": "💬", "announcement": "📢", "urgent": "🚨", "message": "✉️"}
+INBOX_LABEL = {"feedback": "Feedback", "announcement": "Announcement", "urgent": "Urgent", "message": "Message"}
+INBOX_LOUD = ("feedback", "announcement", "urgent")  # these ping; plain messages arrive silently
+URGENT_RE = re.compile(r"urgent|\basap\b|cancel|postpone|reschedul|campus is closed|(?:don'?t|do not) come|no class|휴강|보강|취소|긴급|연기", re.I)
 RES_ICON = {"ubfile": "📄", "vod": "🎥", "folder": "📁", "url": "🔗", "page": "📝"}  # course items that need no submission
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -73,6 +78,7 @@ db.executescript(
     CREATE TABLE IF NOT EXISTS grades(uid TEXT PRIMARY KEY, course TEXT, item TEXT, grade TEXT, max TEXT, pct TEXT, kind TEXT, updated INTEGER);
     CREATE TABLE IF NOT EXISTS health(job TEXT PRIMARY KEY, last_ok INTEGER, last_err TEXT, fails INTEGER NOT NULL DEFAULT 0, alerted INTEGER NOT NULL DEFAULT 0);
     CREATE TABLE IF NOT EXISTS kv(key TEXT PRIMARY KEY, value TEXT);
+    CREATE TABLE IF NOT EXISTS inbox(uid TEXT PRIMARY KEY, kind TEXT, course TEXT, sender TEXT, ts TEXT, title TEXT, url TEXT, preview TEXT);
     CREATE TABLE IF NOT EXISTS attendance(uid TEXT PRIMARY KEY, course TEXT, day TEXT, cls TEXT, status TEXT);
     """
 )
@@ -454,6 +460,95 @@ def scrape_attendance():
     return out
 
 
+def _clean(text, n):
+    text = re.sub(r"-{5,}", " ", text)
+    text = " ".join(text.split())
+    return text if len(text) <= n else text[: n - 1].rstrip() + "…"
+
+
+def classify_message(text):
+    """'feedback' | 'announcement' | 'urgent' | 'message' for an inbox message's text."""
+    if re.search(r"has\s+posted\s+some\s+feedback\s+on\s+your\s+assignment", text, re.I):
+        return "feedback"
+    if re.search(r"->\s*(?:Forums|포럼)\s*->\s*(?:Announcements?|News|Notices?|공지)", text, re.I):
+        return "announcement"
+    return "urgent" if URGENT_RE.search(text) else "message"
+
+
+def parse_messages(page):
+    """[(uid, kind, course, sender, 'YYYY-MM-DD HH:MM', title, url, preview)] from the messages inbox, newest first.
+
+    None if the page has no message list at all (not the inbox, or eclass changed it).
+    """
+    box = BeautifulSoup(page, "html.parser").select_one("div.message_list")
+    if box is None:
+        return None
+    out = []
+    for li in box.select("li.media"):
+        sender, when, msg = li.select_one("h4"), li.select_one(".time"), li.select_one(".msg")
+        if not (sender and when and msg):
+            continue
+        a = li.select_one(".media-body > a[href]")
+        who = re.search(r"[?&]id=(\d+)", a["href"]).group(1) if a and re.search(r"[?&]id=(\d+)", a["href"]) else "0"
+        text = msg.get_text()
+        lines = [ln.strip() for ln in text.strip().splitlines()]
+        head = lines[0] if lines else ""
+        course = (re.match(r"\(?\s*([^\[(]+?)\s*[\[(]", head) or [None, ""])[1]
+        url = (re.search(r"https?://\S+", text) or [None])[0]
+        kind = classify_message(text)
+        if "->" in head:  # system mail: 'Course -> Forums -> Announcements -> Title', body after the dashed line
+            title = head.split("->")[-1].strip()
+            body = re.split(r"-{10,}", text, maxsplit=1)[-1] if re.search(r"-{10,}", text) else ""
+            preview = "" if kind == "feedback" else _clean(body, 220)
+            if kind == "feedback":
+                title = (re.search(r"for '([^']+)'", text) or [None, title])[1]
+        else:  # a message written by a person
+            body = re.sub(r"^\(?\s*[^\[(]+[\[(][^\])]*[\])]\)?\s*", "", " ".join(text.split()))
+            title, preview = _clean(body, 70), ""
+        uid = f"msg:{who}:{when.get_text(strip=True)}:{hashlib.sha1(text.encode()).hexdigest()[:8]}"
+        out.append((uid, kind, course, sender.get_text(strip=True), when.get_text(strip=True), title, url, preview))
+    return out
+
+
+def parse_notices(page):
+    """[(uid, 'announcement', course, writer, 'YYYY-MM-DD', title, url, '')] from the all-courses Notice Board. None if absent."""
+    table = BeautifulSoup(page, "html.parser").select_one("table.ubboard_table")
+    if table is None:
+        return None
+    out = []
+    for tr in table.select("tbody tr"):
+        cells = tr.find_all("td")
+        a = tr.select_one("a[href*='bwid=']")
+        if len(cells) < 4 or not a:
+            continue
+        strong = a.select_one("strong")
+        course = re.sub(r"^\[|\]$", "", strong.get_text(strip=True)) if strong else ""
+        if strong:
+            strong.decompose()
+        bwid = re.search(r"bwid=(\d+)", a["href"]).group(1)
+        out.append((f"notice:{bwid}", "announcement", course, cells[2].get_text(strip=True), cells[3].get_text(strip=True),
+                    " ".join(a.get_text().split()), a["href"], ""))
+    return out
+
+
+def scrape_inbox():
+    """{'msg': [...], 'notice': [...]} for the inbox pages that could be read. Blocking."""
+    out = {}
+    for src, path, parse in (("msg", "/local/ubmessage/", parse_messages), ("notice", "/mod/ubboard/my.php", parse_notices)):
+        try:
+            items = parse(web_get(MOODLE_URL + path).text)
+        except RuntimeError:
+            raise
+        except Exception as e:
+            log.warning("inbox %s failed: %s", src, e)
+            continue
+        if items is None:
+            log.warning("inbox %s: page not recognised", src)
+        else:
+            out[src] = items
+    return out
+
+
 # ---------- sync jobs ----------
 async def sync_events():
     """Pull deadlines and submission status from the course pages; alert on new and moved ones."""
@@ -615,6 +710,38 @@ async def check_digest(now=None):
     db.commit()  # marked only after a successful send, so a Telegram hiccup is retried on the next tick
 
 
+def inbox_item(row):
+    kind, course, sender, ts, title, url, preview = row
+    head = f"{INBOX_ICON[kind]} <b>{INBOX_LABEL[kind]}</b> · {esc(short_course(course))}"
+    name = f'<a href="{esc(url)}">{esc(title)}</a>' if url else esc(title)
+    out = f"{head}\n{name}" + (f" — {esc(sender)}" if sender else "")
+    return out + (f"\n<i>{esc(preview)}</i>" if preview else "")
+
+
+async def sync_inbox():
+    """Messages and Notice Board posts. Feedback, announcements and urgent notices ping; the rest arrives silently.
+
+    Each source's first read only records what is already there (kv 'inbox_seen:<source>').
+    """
+    if not (ECLASS_USERNAME and ECLASS_PASSWORD):
+        raise RuntimeError("ECLASS_USERNAME / ECLASS_PASSWORD not set")
+    found = await asyncio.to_thread(scrape_inbox)
+    new = []
+    for src, items in found.items():
+        first = not db.execute("SELECT 1 FROM kv WHERE key=?", (f"inbox_seen:{src}",)).fetchone()
+        for it in items:
+            if not db.execute("SELECT 1 FROM inbox WHERE uid=?", (it[0],)).fetchone():
+                db.execute("INSERT INTO inbox VALUES(?,?,?,?,?,?,?,?)", it)
+                if not first:
+                    new.append(it)
+        db.execute("INSERT OR IGNORE INTO kv VALUES(?,'1')", (f"inbox_seen:{src}",))
+    db.commit()
+    for loud in (True, False):
+        group = [it[1:2] + it[2:8] for it in new if (it[1] in INBOX_LOUD) == loud]
+        for i in range(0, len(group), 6):  # stay under Telegram's message size limit
+            await bot.send_message(CHAT_ID, "\n\n".join(inbox_item(r) for r in group[i : i + 6]), disable_notification=not loud)
+
+
 async def sync_attendance():
     """Pull offline attendance from eclass; alert when a class is marked absent, late or other (first run only records)."""
     if not (ECLASS_USERNAME and ECLASS_PASSWORD):
@@ -640,6 +767,7 @@ async def sync_attendance():
 JOB_LABEL = {
     "sync_events": "deadlines",
     "sync_attendance": "attendance",
+    "sync_inbox": "inbox",
     "sync_grades": "grades",
     "check_reminders": "reminders",
     "check_digest": "daily digest",
@@ -705,7 +833,7 @@ async def run_cycle(jobs, alert=True):
 async def poll_loop():
     polls = 0
     while True:
-        jobs = [sync_events, sync_attendance] + ([sync_grades] if polls % GRADES_EVERY == 0 else [])
+        jobs = [sync_events, sync_attendance, sync_inbox] + ([sync_grades] if polls % GRADES_EVERY == 0 else [])
         polls += 1
         await run_cycle(jobs)
         await asyncio.sleep(POLL_MINUTES * 60)
@@ -854,6 +982,15 @@ async def answer_chunks(m: Message, text):
     await m.answer(chunk)
 
 
+def render_inbox(rows):
+    """rows: (kind, course, sender, ts, title, url), newest first."""
+    out = []
+    for kind, course, sender, ts, title, url in rows:
+        name = f'<a href="{esc(url)}">{esc(title)}</a>' if url else esc(title)
+        out.append(f"{INBOX_ICON[kind]} {name} · {esc(short_course(course))} · {esc(ts[:10])}")
+    return "\n".join(out)
+
+
 MENU = [
     ("upcoming", "Next 15 deadlines"),
     ("today", "Due in the next 24 hours"),
@@ -863,6 +1000,7 @@ MENU = [
     ("resources", "Latest course materials"),
     ("grades", "Your grades"),
     ("attendance", "Your offline attendance"),
+    ("inbox", "Latest messages and notices"),
     ("sync", "Refresh from eclass now"),
     ("status", "Is the bot working?"),
     ("help", "What this bot does"),
@@ -871,7 +1009,7 @@ KEYBOARD = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="/upcoming"), KeyboardButton(text="/today"), KeyboardButton(text="/week"), KeyboardButton(text="/missed")],
         [KeyboardButton(text="/resources"), KeyboardButton(text="/grades"), KeyboardButton(text="/attendance")],
-        [KeyboardButton(text="/sync"), KeyboardButton(text="/status"), KeyboardButton(text="/help")],
+        [KeyboardButton(text="/inbox"), KeyboardButton(text="/sync"), KeyboardButton(text="/status"), KeyboardButton(text="/help")],
     ],
     resize_keyboard=True,
     is_persistent=True,
@@ -889,6 +1027,7 @@ HELP = (
     "Add a word to filter: <code>/resources database</code>\n"
     "/grades — your course totals. Add a word for the details of one course: <code>/grades database</code>\n"
     "/attendance — offline attendance of the courses that have it. Add a word for every class of one course: <code>/attendance operating</code>\n"
+    "/inbox — latest messages (feedback, announcements, teachers) and notices. Add a word to filter: <code>/inbox attendance</code>\n"
     "/sync — check eclass right now\n"
     "/status — when each check last worked, and whether anything is failing\n\n"
     "<b>Icons</b>\n"
@@ -903,6 +1042,7 @@ HELP = (
     "☀️ a morning summary of what is due today and tomorrow, if you turned it on (nothing due: no message)\n"
     "📊 new or changed grade (checked every third refresh)\n"
     "🗓 a class marked absent, late or other\n"
+    "💬 feedback on your work · 📢 an announcement · 🚨 an urgent notice (these ping) · ✉️ any other message (silent)\n"
     "⚠️ a check keeps failing (eclass changed, wrong password…) · ✅ it works again\n"
     "Tap a title to open it on eclass."
 )
@@ -966,6 +1106,17 @@ async def cmd_missed(m: Message):
     await reply_list(m, missed(), f"Nothing missed in the last {MISSED_DAYS} days 🎉")
 
 
+@dp.message(Command("inbox"))
+async def cmd_inbox(m: Message, command: CommandObject):
+    """Latest messages and notices; '/inbox word' filters by course, sender or title."""
+    q, args = "SELECT kind,course,sender,ts,title,url FROM inbox", []
+    if command.args:
+        q += " WHERE course LIKE ? ESCAPE '\\' OR sender LIKE ? ESCAPE '\\' OR title LIKE ? ESCAPE '\\' OR preview LIKE ? ESCAPE '\\'"
+        args = [like(command.args)] * 4
+    rows = db.execute(q + " ORDER BY ts DESC LIMIT 10", args).fetchall()
+    await m.answer(render_inbox(rows) if rows else ("Nothing matches that" if command.args else "No messages yet — try /sync first"))
+
+
 @dp.message(Command("resources"))
 async def cmd_resources(m: Message, command: CommandObject):
     """Latest course materials (no submission needed); '/resources database' filters by course or title."""
@@ -1009,7 +1160,7 @@ async def cmd_attendance(m: Message, command: CommandObject):
 
 @dp.message(Command("sync"))
 async def cmd_sync(m: Message):
-    jobs = (sync_events, sync_grades, sync_attendance)  # one failing job doesn't stop the others
+    jobs = (sync_events, sync_grades, sync_attendance, sync_inbox)  # one failing job doesn't stop the others
     errors = await run_cycle(jobs, alert=False)
     failed = [f"{JOB_LABEL[j.__name__]}: {esc(e) or type(e).__name__}" for j, e in zip(jobs, errors) if e]
     await m.answer("Synced ✅" if not failed else "Synced, but:\n" + "\n".join(failed))

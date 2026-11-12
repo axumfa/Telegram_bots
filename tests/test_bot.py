@@ -10,6 +10,8 @@ from bot import (
     clean_title,
     parse_activity_grade,
     parse_attendance,
+    parse_messages,
+    parse_notices,
     parse_due,
     parse_grade_report,
     parse_overview,
@@ -92,7 +94,7 @@ async def test_new_resources_announced_once(b, monkeypatch):
 
 def test_menu_matches_handlers(b):
     cmds = {c for c, _ in b.MENU}
-    assert cmds == {"upcoming", "today", "week", "missed", "done", "resources", "grades", "attendance", "sync", "status", "help"}
+    assert cmds == {"upcoming", "today", "week", "missed", "done", "resources", "grades", "attendance", "inbox", "sync", "status", "help"}
     assert all(len(d) <= 256 for _, d in b.MENU)
     assert "<course>" not in b.HELP  # raw angle brackets would break Telegram's HTML parsing
 
@@ -236,7 +238,7 @@ async def test_failed_course_keeps_old_grades(b, monkeypatch):
 
 
 async def test_grades_checked_every_third_poll(b, monkeypatch):
-    calls = {"events": 0, "attendance": 0, "grades": 0}
+    calls = {"events": 0, "attendance": 0, "inbox": 0, "grades": 0}
 
     def counter(name):
         async def job():
@@ -256,7 +258,7 @@ async def test_grades_checked_every_third_poll(b, monkeypatch):
     monkeypatch.setattr(b.asyncio, "sleep", fake_sleep)
     with pytest.raises(asyncio.CancelledError):
         await b.poll_loop()
-    assert calls == {"events": 7, "attendance": 7, "grades": 3}  # polls 1, 4 and 7
+    assert calls == {"events": 7, "attendance": 7, "inbox": 7, "grades": 3}  # polls 1, 4 and 7
 
 
 # ---------- grades from assignment / quiz pages (courses that hide their gradebook) ----------
@@ -780,3 +782,121 @@ async def test_digest_window_and_retry_after_a_failed_send(b, monkeypatch):
 
 def test_status_hides_digest_when_off(b):
     assert "daily digest" not in b.render_status()
+
+
+# ---------- inbox: messages and notices ----------
+def test_parse_messages_real_page_classifies_each_kind():
+    rows = parse_messages(fixture("inbox_messages.html"))
+    assert [r[1] for r in rows] == ["feedback", "announcement", "urgent", "message", "message"]
+    feedback, announcement, urgent = rows[0], rows[1], rows[2]
+    assert feedback[2:6] == ("Computer Algorithm", "Anon Teacher 1", "2026-10-14 10:30", "Assignment#2")
+    assert feedback[6] == "https://eclass.inha.ac.kr/mod/assign/view.php?id=71855" and feedback[7] == ""
+    assert announcement[2] == "Engineering Communications" and announcement[5] == "Attendance Policy"
+    assert announcement[6].endswith("discuss.php?d=2700#p6231") and announcement[7].startswith("UPDATED: October 3, 2026 Dear students")
+    assert len(announcement[7]) <= 220 and "---" not in announcement[7]
+    assert "campus is closed" in urgent[5] and urgent[2] == "Computer Architecture"  # '(Course[code]) text' form
+    assert len({r[0] for r in rows}) == 5  # every message has its own id, even from the same sender
+
+
+def test_parse_messages_not_the_inbox():
+    assert parse_messages("<html><body>Please log in</body></html>") is None
+
+
+def test_parse_notices_real_page():
+    rows = parse_notices(fixture("inbox_notices.html"))
+    assert [r[0] for r in rows] == ["notice:7622", "notice:7617", "notice:7612"]
+    assert rows[0][1:6] == ("announcement", "Electronic Circuit[202602-ICE2080-001]", "Anon Professor", "2026-09-12", "Telegram Channel")
+    assert rows[0][6].endswith("bwid=7622")
+    assert parse_notices("<p>nope</p>") is None
+
+
+@pytest.mark.parametrize(
+    "text, kind",
+    [
+        ("Please come to my office on Wed", "message"),
+        ("Class is cancelled tomorrow", "urgent"),
+        ("The exam is postponed to Friday", "urgent"),
+        ("Don't come to campus", "urgent"),
+        ("내일 수업은 휴강입니다", "urgent"),
+        ("X -> Forums -> Announcements -> Hello", "announcement"),
+        ("X -> Forums -> General discussion -> Hi", "message"),
+        ("A has posted some feedback on your\nassignment submission for 'HW'", "feedback"),
+    ],
+)
+def test_classify_message(text, kind):
+    assert __import__("bot").classify_message(text) == kind
+
+
+def test_fixtures_hold_no_teacher_names():
+    for f in ("inbox_messages.html", "inbox_notices.html"):
+        t = fixture(f)
+        assert "profile.php" not in t and "sesskey" not in t.replace("sesskey=X", "")
+        assert not any(n in t for n in ("Munisa", "Khankeldiyev", "Chongkoo", "June Sup"))
+
+
+def _scrape_inbox(monkeypatch, b, state):
+    monkeypatch.setattr(b, "ECLASS_USERNAME", "u")
+    monkeypatch.setattr(b, "ECLASS_PASSWORD", "p")
+    monkeypatch.setattr(b, "scrape_inbox", lambda: state)
+
+
+def inb(uid, kind, title="T", course="Operating System[001]"):
+    return (uid, kind, course, "Someone", "2026-11-10 10:00", title, "https://e/x", "preview text")
+
+
+@pytest.fixture
+def clean_inbox(b):
+    b.db.execute("DELETE FROM inbox")
+    b.db.execute("DELETE FROM kv")
+
+
+async def test_inbox_first_read_is_silent_then_new_items_ping_by_kind(b, monkeypatch, clean_inbox):
+    _scrape_inbox(monkeypatch, b, {"msg": [inb("m1", "feedback")], "notice": []})
+    await b.sync_inbox()
+    assert b.sent == []  # what is already there is only recorded
+
+    _scrape_inbox(monkeypatch, b, {"msg": [inb("m1", "feedback"), inb("m2", "feedback", "HW 3"), inb("m3", "message", "hi"),
+                                           inb("m4", "urgent", "closed"), inb("m5", "announcement", "News")],
+                                   "notice": [inb("notice:1", "announcement", "Board post")]})
+    await b.sync_inbox()
+    loud = [(t, kw["disable_notification"]) for t, kw in zip(b.sent, b.sent_kw)]
+    assert [silent for _, silent in loud] == [False, True]  # one loud message, one silent message
+    assert all(w in loud[0][0] for w in ("HW 3", "closed", "News", "Board post")) and "hi" not in loud[0][0]
+    assert "💬" in loud[0][0] and "🚨" in loud[0][0] and "📢" in loud[0][0]
+    assert "✉️" in loud[1][0] and "hi" in loud[1][0]
+
+    await b.sync_inbox()
+    assert len(b.sent) == 2  # nothing repeats
+
+
+async def test_a_source_that_was_empty_still_announces_its_first_post(b, monkeypatch, clean_inbox):
+    _scrape_inbox(monkeypatch, b, {"msg": [], "notice": []})
+    await b.sync_inbox()  # both read fine, both empty
+    _scrape_inbox(monkeypatch, b, {"msg": [], "notice": [inb("notice:9", "announcement", "First ever notice")]})
+    await b.sync_inbox()
+    assert len(b.sent) == 1 and "First ever notice" in b.sent[0] and b.sent_kw[0]["disable_notification"] is False
+
+
+async def test_a_source_that_failed_is_not_marked_seen(b, monkeypatch, clean_inbox):
+    _scrape_inbox(monkeypatch, b, {"msg": [inb("m1", "message")]})  # the notice board could not be read
+    await b.sync_inbox()
+    _scrape_inbox(monkeypatch, b, {"msg": [inb("m1", "message")], "notice": [inb("notice:1", "announcement", "old post")]})
+    await b.sync_inbox()
+    assert b.sent == []  # the notice board's first successful read is silent too
+
+
+async def test_inbox_texts_are_escaped_and_batched(b, monkeypatch, clean_inbox):
+    _scrape_inbox(monkeypatch, b, {"msg": [], "notice": []})
+    await b.sync_inbox()
+    many = [inb(f"m{i}", "announcement", f"News <b>{i}") for i in range(7)]
+    _scrape_inbox(monkeypatch, b, {"msg": many, "notice": []})
+    await b.sync_inbox()
+    assert len(b.sent) == 2 and "&lt;b&gt;" in b.sent[0] and "<b>News" not in b.sent[0]  # 6 + 1 per message
+
+
+def test_render_inbox(b):
+    rows = [("announcement", "Operating System[001]", "T", "2026-11-10 10:00", "Exam <room>", "https://e/1"),
+            ("message", "Database[001]", "T", "2026-11-09 09:00", "hello", None)]
+    out = b.render_inbox(rows).split("\n")
+    assert out[0] == '📢 <a href="https://e/1">Exam &lt;room&gt;</a> · Operating System · 2026-11-10'
+    assert out[1] == "✉️ hello · Database · 2026-11-09"
