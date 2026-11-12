@@ -92,7 +92,7 @@ async def test_new_resources_announced_once(b, monkeypatch):
 
 def test_menu_matches_handlers(b):
     cmds = {c for c, _ in b.MENU}
-    assert cmds == {"upcoming", "today", "week", "resources", "grades", "attendance", "sync", "status", "help"}
+    assert cmds == {"upcoming", "today", "week", "missed", "resources", "grades", "attendance", "sync", "status", "help"}
     assert all(len(d) <= 256 for _, d in b.MENU)
     assert "<course>" not in b.HELP  # raw angle brackets would break Telegram's HTML parsing
 
@@ -499,3 +499,37 @@ def test_empty_home_page_is_an_error(b, monkeypatch):
     monkeypatch.setattr(b, "web_get", lambda url, **kw: R)
     with pytest.raises(RuntimeError, match="no courses"):
         b.list_courses()
+
+
+# ---------- missed deadlines ----------
+def add_event(b, uid, off_days, status, kind="assign"):
+    ts = time.time() + off_days * 86400
+    b.db.execute("INSERT INTO events(uid,title,course,start_ts,status,kind) VALUES(?,?,?,?,?,?)", (uid, uid, COURSE, ts, status, kind))
+
+
+def test_missed_lists_recent_unsubmitted_newest_first(b):
+    add_event(b, "old", -40, "todo")  # beyond the look-back
+    add_event(b, "a", -10, "todo")
+    add_event(b, "b", -2, "todo")
+    add_event(b, "done", -3, "done")
+    add_event(b, "unknown", -3, "?")  # can't tell: not claimed as missed
+    add_event(b, "future", 2, "todo")
+    assert [r[0] for r in b.missed()] == ["b", "a"]
+
+
+def _stub_site(monkeypatch, b, opened):
+    monkeypatch.setattr(b, "list_courses", lambda: {"1": "C"})
+    monkeypatch.setattr(b, "course_activities", lambda cid, name: ("C", [("assign", "9", "HW", "https://e/9")], []))
+    monkeypatch.setattr(b, "web_get", lambda url, **kw: opened.append(url) or type("R", (), {"text": ASSIGN})())
+
+
+def test_recently_passed_unsubmitted_items_are_still_rechecked(b, monkeypatch):
+    opened = []
+    _stub_site(monkeypatch, b, opened)
+    now = time.time()
+    b.scrape_courses({"assign-9": (now - 3600, "todo")})  # due an hour ago: a late submission may have happened
+    assert opened == ["https://e/9"]
+    opened.clear()
+    b.scrape_courses({"assign-9": (now - 5 * 86400, "todo")})  # long past: left alone
+    b.scrape_courses({"assign-9": (now + 3600, "done")})  # submitted: left alone
+    assert opened == []

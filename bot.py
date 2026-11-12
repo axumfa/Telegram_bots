@@ -27,6 +27,8 @@ ECLASS_USERNAME = os.getenv("ECLASS_USERNAME", "")
 ECLASS_PASSWORD = os.getenv("ECLASS_PASSWORD", "")
 POLL_MINUTES = int(os.getenv("POLL_MINUTES", "20"))
 GRADES_EVERY = 3  # check grades on every 3rd poll
+RECHECK_DAYS = 2  # keep re-reading an unsubmitted item this long after its deadline (last-minute and late submissions)
+MISSED_DAYS = 30  # /missed looks back this far
 FAIL_ALERT = 3  # consecutive failures of one job before the bot tells you
 TZ = ZoneInfo("Asia/Tashkent")
 UA = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:130.0) Gecko/20100101 Firefox/130.0"}
@@ -248,7 +250,7 @@ def course_activities(cid, fallback_name):
 def scrape_courses(known):
     """known: {uid: (start_ts, status)} -> ([(uid, title, course, ts, url, kind, status)], [(uid, title, course, kind, url)]).
 
-    Walks every course page; opens an activity only if it may still change (not done, not past).
+    Walks every course page; opens an activity only if it may still change (not done, and not long past).
     One failure doesn't stop the rest. Blocking.
     """
     now = datetime.now(timezone.utc).timestamp()
@@ -265,7 +267,7 @@ def scrape_courses(known):
         for kind, mid, title, url in acts:
             uid = f"{kind}-{mid}"
             ts, status = known.get(uid, (None, None))
-            if ts is not None and (status == "done" or ts < now):
+            if ts is not None and (status == "done" or ts < now - RECHECK_DAYS * 86400):
                 continue
             try:
                 page = web_get(url).text
@@ -699,6 +701,15 @@ def upcoming(days=None, limit=15, hide_done=False, until=None):
     return db.execute(q + " ORDER BY start_ts LIMIT ?", args + [limit]).fetchall()
 
 
+def missed(days=MISSED_DAYS, limit=20):
+    """Unsubmitted items whose deadline passed in the last `days` days, newest first."""
+    now = datetime.now(timezone.utc).timestamp()
+    return db.execute(
+        f"SELECT {COLS} FROM events WHERE start_ts < ? AND start_ts > ? AND status = 'todo' ORDER BY start_ts DESC LIMIT ?",
+        (now, now - days * 86400, limit),
+    ).fetchall()
+
+
 async def reply_list(m: Message, rows, empty):
     await m.answer(render(rows) if rows else empty)
 
@@ -801,6 +812,7 @@ MENU = [
     ("upcoming", "Next 15 deadlines"),
     ("today", "Due in the next 24 hours"),
     ("week", "Due until the end of next Sunday"),
+    ("missed", "Deadlines that passed unsubmitted"),
     ("resources", "Latest course materials"),
     ("grades", "Your grades"),
     ("attendance", "Your offline attendance"),
@@ -810,8 +822,9 @@ MENU = [
 ]
 KEYBOARD = ReplyKeyboardMarkup(
     keyboard=[
-        [KeyboardButton(text="/upcoming"), KeyboardButton(text="/today"), KeyboardButton(text="/week")],
-        [KeyboardButton(text="/resources"), KeyboardButton(text="/grades"), KeyboardButton(text="/attendance"), KeyboardButton(text="/sync"), KeyboardButton(text="/help")],
+        [KeyboardButton(text="/upcoming"), KeyboardButton(text="/today"), KeyboardButton(text="/week"), KeyboardButton(text="/missed")],
+        [KeyboardButton(text="/resources"), KeyboardButton(text="/grades"), KeyboardButton(text="/attendance")],
+        [KeyboardButton(text="/sync"), KeyboardButton(text="/status"), KeyboardButton(text="/help")],
     ],
     resize_keyboard=True,
     is_persistent=True,
@@ -823,6 +836,7 @@ HELP = (
     "/upcoming — next 15 deadlines\n"
     "/today — due in the next 24 hours\n"
     "/week — due until the end of next Sunday (so next weekend is included)\n"
+    f"/missed — deadlines of the last {MISSED_DAYS} days that passed without a submission\n"
     "/resources — latest course materials (files, videos, links). "
     "Add a word to filter: <code>/resources database</code>\n"
     "/grades — your course totals. Add a word for the details of one course: <code>/grades database</code>\n"
@@ -863,6 +877,11 @@ async def cmd_today(m: Message):
 async def cmd_week(m: Message):
     now = datetime.now(timezone.utc).timestamp()
     await reply_list(m, upcoming(until=week_end(now), limit=30, hide_done=True), "Nothing due this week 🎉")
+
+
+@dp.message(Command("missed"))
+async def cmd_missed(m: Message):
+    await reply_list(m, missed(), f"Nothing missed in the last {MISSED_DAYS} days 🎉")
 
 
 @dp.message(Command("resources"))
