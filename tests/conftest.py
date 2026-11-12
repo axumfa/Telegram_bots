@@ -20,10 +20,11 @@ import bot as botmod  # noqa: E402
 @pytest.fixture
 def b(monkeypatch):
     """bot module with a recording send_message."""
-    sent = []
+    sent, sent_kw = [], []
 
     async def fake_send(chat_id, text, **kw):
         sent.append(text)
+        sent_kw.append(kw)
 
     monkeypatch.setattr(botmod.bot, "send_message", fake_send)
     botmod.db.execute("DELETE FROM events")
@@ -32,4 +33,5 @@ def b(monkeypatch):
     botmod.db.execute("DELETE FROM attendance")
     botmod.db.execute("DELETE FROM health")
     botmod.sent = sent
+    botmod.sent_kw = sent_kw
     return botmod

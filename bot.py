@@ -14,7 +14,15 @@ from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.filters import Command, CommandObject
-from aiogram.types import BotCommand, KeyboardButton, Message, ReplyKeyboardMarkup
+from aiogram.types import (
+    BotCommand,
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    KeyboardButton,
+    Message,
+    ReplyKeyboardMarkup,
+)
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 
@@ -49,7 +57,9 @@ RES_ICON = {"ubfile": "📄", "vod": "🎥", "folder": "📁", "url": "🔗", "p
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("eclass-bot")
 
-COLS = "uid,title,course,start_ts,url,status"
+# your own "done" (for things handed in elsewhere) wins over what eclass shows; "mute" only silences reminders
+STATUS = "CASE WHEN override = 'done' THEN 'done' ELSE status END"
+COLS = f"uid,title,course,start_ts,url,{STATUS}"
 
 db = sqlite3.connect(os.getenv("DB_PATH", "eclass.db"))
 db.executescript(
@@ -63,7 +73,7 @@ db.executescript(
     CREATE TABLE IF NOT EXISTS attendance(uid TEXT PRIMARY KEY, course TEXT, day TEXT, cls TEXT, status TEXT);
     """
 )
-for col in ("url", "kind", "status"):  # added later; migrate old databases
+for col in ("url", "kind", "status", "override"):  # added later; migrate old databases
     try:
         db.execute(f"ALTER TABLE events ADD COLUMN {col} TEXT")
     except sqlite3.OperationalError:
@@ -496,10 +506,27 @@ async def send_new_resources(rows):
         await bot.send_message(CHAT_ID, "📚 <b>New material</b>\n\n" + render_resources(rows[i : i + 25]))
 
 
+def item_row(uid, title, state=None):
+    """Buttons of one item: ✅ done / 🔕 mute, or (after one was pressed) a single undo button."""
+    name = clean_title(title)[:22]
+    if state:
+        return [InlineKeyboardButton(text=f"↩️ undo · {'✅' if state == 'done' else '🔕'} {name}", callback_data=f"undo:{uid}")]
+    return [
+        InlineKeyboardButton(text=f"✅ {name}", callback_data=f"done:{uid}"),
+        InlineKeyboardButton(text="🔕 mute", callback_data=f"mute:{uid}"),
+    ]
+
+
+def action_keyboard(rows):
+    """✅ marks an item done (submitted elsewhere), 🔕 stops its reminders."""
+    return InlineKeyboardMarkup(inline_keyboard=[item_row(r[0], r[1]) for r in rows])
+
+
 async def check_reminders():
     now = datetime.now(timezone.utc).timestamp()
     rows = db.execute(
-        f"SELECT {COLS} FROM events WHERE start_ts > ? AND COALESCE(status,'') != 'done' ORDER BY start_ts",
+        f"SELECT {COLS} FROM events WHERE start_ts > ? AND COALESCE({STATUS},'') != 'done' "
+        "AND COALESCE(override,'') != 'mute' ORDER BY start_ts",
         (now,),
     ).fetchall()
     batches = {}  # label -> rows, so items due together arrive as one message
@@ -517,7 +544,9 @@ async def check_reminders():
         batches.setdefault(label, []).append(row)
     db.commit()
     for label, items in batches.items():
-        await bot.send_message(CHAT_ID, f"⏰ <b>Due in {label}</b>\n" + "\n".join(line(r) for r in items))
+        await bot.send_message(
+            CHAT_ID, f"⏰ <b>Due in {label}</b>\n" + "\n".join(line(r) for r in items), reply_markup=action_keyboard(items)
+        )
 
 
 async def sync_news():
@@ -688,7 +717,7 @@ def week_end(now):
     return datetime(d.year, d.month, d.day, tzinfo=TZ).timestamp()
 
 
-def upcoming(days=None, limit=15, hide_done=False, until=None):
+def upcoming(days=None, limit=15, hide_done=False, until=None, match=None):
     now = datetime.now(timezone.utc).timestamp()
     q, args = f"SELECT {COLS} FROM events WHERE start_ts > ?", [now]
     if days is not None:
@@ -697,7 +726,10 @@ def upcoming(days=None, limit=15, hide_done=False, until=None):
         q += " AND start_ts < ?"
         args.append(until)
     if hide_done:
-        q += " AND COALESCE(status,'') != 'done'"
+        q += f" AND COALESCE({STATUS},'') != 'done'"
+    if match:
+        q += " AND (course LIKE ? OR title LIKE ?)"
+        args += [f"%{match}%"] * 2
     return db.execute(q + " ORDER BY start_ts LIMIT ?", args + [limit]).fetchall()
 
 
@@ -705,7 +737,7 @@ def missed(days=MISSED_DAYS, limit=20):
     """Unsubmitted items whose deadline passed in the last `days` days, newest first."""
     now = datetime.now(timezone.utc).timestamp()
     return db.execute(
-        f"SELECT {COLS} FROM events WHERE start_ts < ? AND start_ts > ? AND status = 'todo' ORDER BY start_ts DESC LIMIT ?",
+        f"SELECT {COLS} FROM events WHERE start_ts < ? AND start_ts > ? AND {STATUS} = 'todo' ORDER BY start_ts DESC LIMIT ?",
         (now, now - days * 86400, limit),
     ).fetchall()
 
@@ -813,6 +845,7 @@ MENU = [
     ("today", "Due in the next 24 hours"),
     ("week", "Due until the end of next Sunday"),
     ("missed", "Deadlines that passed unsubmitted"),
+    ("done", "Mark something as handed in / mute it"),
     ("resources", "Latest course materials"),
     ("grades", "Your grades"),
     ("attendance", "Your offline attendance"),
@@ -836,6 +869,7 @@ HELP = (
     "/upcoming — next 15 deadlines\n"
     "/today — due in the next 24 hours\n"
     "/week — due until the end of next Sunday (so next weekend is included)\n"
+    "/done — mark something you handed in elsewhere as done, or mute its reminders. Add a word to narrow it: <code>/done circuit</code>\n"
     f"/missed — deadlines of the last {MISSED_DAYS} days that passed without a submission\n"
     "/resources — latest course materials (files, videos, links). "
     "Add a word to filter: <code>/resources database</code>\n"
@@ -849,7 +883,8 @@ HELP = (
     "Attendance: ✅ present · ❌ absent · 🕒 late · 📝 other · ⏳ not taken yet\n\n"
     "<b>Automatic messages</b>\n"
     "🆕 new deadline · ⚠️ deadline moved\n"
-    "⏰ reminder 7 days, 3 days, 1 day, 6 hours and 1 hour before a deadline (not for submitted work)\n"
+    "⏰ reminder 7 days, 3 days, 1 day, 6 hours and 1 hour before a deadline (not for submitted work). "
+    "Its buttons: ✅ done · 🔕 mute · ↩️ undo\n"
     "📚 new course material\n"
     "📊 new or changed grade (checked every third refresh)\n"
     "🗓 a class marked absent, late or other\n"
@@ -877,6 +912,38 @@ async def cmd_today(m: Message):
 async def cmd_week(m: Message):
     now = datetime.now(timezone.utc).timestamp()
     await reply_list(m, upcoming(until=week_end(now), limit=30, hide_done=True), "Nothing due this week 🎉")
+
+
+@dp.message(Command("done"))
+async def cmd_done(m: Message, command: CommandObject):
+    """The next unfinished items with ✅ / 🔕 buttons; '/done word' narrows it to a course or title."""
+    rows = upcoming(limit=10, hide_done=True, match=(command.args or "").strip() or None)
+    if not rows:
+        await m.answer("Nothing open" + (" matches that" if command.args else " 🎉"))
+        return
+    await m.answer(
+        "Tap ✅ for what you already handed in elsewhere, 🔕 to stop an item's reminders.\n\n" + render(rows),
+        reply_markup=action_keyboard(rows),
+    )
+
+
+@dp.callback_query(F.message.chat.id == CHAT_ID)
+async def on_action(q: CallbackQuery):
+    action, _, uid = (q.data or "").partition(":")
+    row = db.execute("SELECT title FROM events WHERE uid=?", (uid,)).fetchone()
+    if action not in ("done", "mute", "undo") or not row:
+        await q.answer("That item is gone")
+        return
+    state = {"done": "done", "mute": "mute", "undo": None}[action]
+    db.execute("UPDATE events SET override=? WHERE uid=?", (state, uid))
+    db.commit()
+    # change only this item's buttons; the other items in the message keep theirs
+    rows = [
+        item_row(uid, row[0], state) if r[0].callback_data.partition(":")[2] == uid else r
+        for r in (q.message.reply_markup.inline_keyboard if q.message.reply_markup else [])
+    ]
+    await q.answer({"done": "Marked done ✅", "mute": "Muted 🔕", "undo": "Back to normal"}[action])
+    await q.message.edit_reply_markup(reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
 
 
 @dp.message(Command("missed"))

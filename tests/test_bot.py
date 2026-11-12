@@ -92,7 +92,7 @@ async def test_new_resources_announced_once(b, monkeypatch):
 
 def test_menu_matches_handlers(b):
     cmds = {c for c, _ in b.MENU}
-    assert cmds == {"upcoming", "today", "week", "missed", "resources", "grades", "attendance", "sync", "status", "help"}
+    assert cmds == {"upcoming", "today", "week", "missed", "done", "resources", "grades", "attendance", "sync", "status", "help"}
     assert all(len(d) <= 256 for _, d in b.MENU)
     assert "<course>" not in b.HELP  # raw angle brackets would break Telegram's HTML parsing
 
@@ -533,3 +533,83 @@ def test_recently_passed_unsubmitted_items_are_still_rechecked(b, monkeypatch):
     b.scrape_courses({"assign-9": (now - 5 * 86400, "todo")})  # long past: left alone
     b.scrape_courses({"assign-9": (now + 3600, "done")})  # submitted: left alone
     assert opened == []
+
+
+# ---------- /done and mute buttons ----------
+class FakeQuery:
+    def __init__(self, data, markup):
+        self.data, self.answers = data, []
+        self.message = type("M", (), {"chat": type("C", (), {"id": 1})(), "reply_markup": markup})()
+        self.edited = None
+
+        async def edit(reply_markup):
+            self.edited = reply_markup
+
+        self.message.edit_reply_markup = edit
+
+    async def answer(self, text=None):
+        self.answers.append(text)
+
+
+def buttons(markup):
+    return [[(x.text, x.callback_data) for x in row] for row in markup.inline_keyboard]
+
+
+async def test_reminder_comes_with_buttons_and_done_override_wins(b):
+    add_event(b, "assign-1", 0.02, "?")  # ~30 min away, status unknown
+    await b.check_reminders()
+    kb = buttons(b.sent_kw[0]["reply_markup"])
+    assert kb == [[("✅ assign-1", "done:assign-1"), ("🔕 mute", "mute:assign-1")]]
+
+    q = FakeQuery("done:assign-1", b.sent_kw[0]["reply_markup"])
+    await b.on_action(q)
+    assert q.answers == ["Marked done ✅"]
+    assert buttons(q.edited) == [[("↩️ undo · ✅ assign-1", "undo:assign-1")]]
+    row = b.db.execute(f"SELECT {b.STATUS} FROM events WHERE uid='assign-1'").fetchone()
+    assert row == ("done",)
+    assert b.upcoming(hide_done=True) == []  # hidden from /today and /week
+    assert b.missed() == []
+
+    q = FakeQuery("undo:assign-1", q.edited)
+    await b.on_action(q)
+    assert buttons(q.edited)[0][0][1] == "done:assign-1"  # buttons are back
+    assert len(b.upcoming(hide_done=True)) == 1
+
+
+async def test_pressing_one_button_leaves_the_other_items_alone(b):
+    for i in (1, 2):
+        add_event(b, f"assign-{i}", 0.02, "todo")
+    rows = b.upcoming(hide_done=True)
+    q = FakeQuery("mute:assign-2", b.action_keyboard(rows))
+    await b.on_action(q)
+    kb = buttons(q.edited)
+    assert kb[0][0][1] == "done:assign-1" and kb[1] == [("↩️ undo · 🔕 assign-2", "undo:assign-2")]
+
+
+async def test_muted_item_gets_no_reminders_but_stays_listed(b):
+    add_event(b, "assign-1", 0.02, "todo")
+    b.db.execute("UPDATE events SET override='mute' WHERE uid='assign-1'")
+    await b.check_reminders()
+    assert b.sent == []
+    assert len(b.upcoming(hide_done=True)) == 1
+
+
+async def test_override_survives_a_resync_and_unknown_item_is_handled(b, monkeypatch):
+    monkeypatch.setattr(b, "ECLASS_USERNAME", "u")
+    monkeypatch.setattr(b, "ECLASS_PASSWORD", "p")
+    ts = int(time.time()) + 86400
+    monkeypatch.setattr(b, "scrape_courses", lambda known: ([("assign-1", "HW", COURSE, ts, "u", "assign", "todo")], []))
+    await b.sync_events()
+    b.db.execute("UPDATE events SET override='done' WHERE uid='assign-1'")
+    await b.sync_events()  # the scraper still says todo
+    assert b.db.execute("SELECT override FROM events").fetchone() == ("done",)
+    q = FakeQuery("done:nope", None)
+    await b.on_action(q)
+    assert q.answers == ["That item is gone"] and q.edited is None
+
+
+def test_upcoming_match_filters_course_or_title(b):
+    add_event(b, "assign-1", 1, "todo")
+    add_event(b, "quiz-2", 1, "todo")
+    assert [r[0] for r in b.upcoming(match="circuit")] == ["assign-1", "quiz-2"]  # course name
+    assert [r[0] for r in b.upcoming(match="quiz-2")] == ["quiz-2"]

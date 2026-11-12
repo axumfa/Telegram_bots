@@ -7,6 +7,7 @@ Telegram bot that tracks deadlines from eclass.inha.ac.kr (Moodle). Single file:
 - Logs in to eclass like a browser and reads every course page you're enrolled in every `POLL_MINUTES` (default 20): assignments and quizzes with their **deadline** and whether each is **submitted**. Alerts on **new** and **moved** deadlines.
   ✅ submitted · ❌ not yet · ❔ couldn't tell (e.g. "submit on Gradescope"). Submitted items get no reminders and are hidden from `/today` and `/week`.
 - **Missed deadlines**: `/missed` lists items from the last 30 days whose deadline passed while still ❌. An unsubmitted item is re-read for 2 days after its deadline, so a last-minute or late submission is picked up and drops off the list. ❔ items are never called missed.
+- **`/done` and mute**: for something you handed in elsewhere (the ❔ items), tap ✅ on a reminder or in `/done [course or title]` and it counts as submitted everywhere: no reminders, hidden from `/today` and `/week`, never listed as missed. 🔕 only stops that item's reminders. Each press turns into an ↩️ undo button. Your choice survives refreshes.
 - **Reminders** 7 days, 3 days, 1 day, 6 hours and 1 hour before each deadline, once each. Items due together arrive as one message.
 - **Course materials** (files, lecture videos, folders, links, pages — anything without a submission): new ones are announced as 📚 *New material*, grouped by course. `/resources` lists the latest 15; `/resources database` filters by course or title. The first run only records what's already there.
 - **Grades**: `/grades` shows one line per course (its total, when eclass has one, and how many items are graded); `/grades database` shows the graded items of matching courses. Every third refresh (about hourly) the grade reports are re-read and a 📊 message arrives when a grade appears or changes (the first run only records them). Courses that hide their grade report from students (eclass answers "Can not view grades") are read from the grade shown on each assignment and quiz instead, so they list graded items but have no course total. A course with no assignments or quizzes (e.g. Engineering Communications) has nothing to show.
@@ -25,7 +26,7 @@ Quote the password in `.env` if it contains spaces or `#`. `.env` is mode 600 an
 
 ## Commands
 
-`/upcoming` next 15 · `/today` next 24 h · `/week` until the end of next Sunday (≥ 7 days, so next weekend is always included) · `/missed` passed unsubmitted · `/resources [course]` latest materials · `/grades [course]` your grades · `/attendance [course]` offline attendance · `/sync` refresh now · `/help` explains everything (also shown by `/start`, with tap-able buttons; the same list is in Telegram's command menu)
+`/upcoming` next 15 · `/today` next 24 h · `/week` until the end of next Sunday (≥ 7 days, so next weekend is always included) · `/missed` passed unsubmitted · `/done [course]` mark handed in / mute · `/resources [course]` latest materials · `/grades [course]` your grades · `/attendance [course]` offline attendance · `/sync` refresh now · `/help` explains everything (also shown by `/start`, with tap-able buttons; the same list is in Telegram's command menu)
 
 Only the chat id in `.env` is answered.
 
