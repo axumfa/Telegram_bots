@@ -1263,10 +1263,8 @@ async def test_download_button_sends_document(b, monkeypatch):
     b.db.execute("INSERT INTO resources VALUES('ubfile-1','Lecture 1',?, 'ubfile','https://e/m',0)", (COURSE,))
     b.db.execute("INSERT INTO resources VALUES('vod-2','Video',?, 'vod','https://e/v',0)", (COURSE,))
     rows = b.db.execute("SELECT uid,title,course,kind,url FROM resources").fetchall()
-    monkeypatch.setattr(b, "BOT_USERNAME", "my_bot")
-    text = b.render_resources(rows)
-    assert 'href="https://t.me/my_bot?start=dl_ubfile-1"' in text  # a file title downloads
-    assert 'href="https://e/v"' in text  # a video still opens eclass
+    kb = b.download_keyboard(rows)
+    assert [r[0].callback_data for r in kb.inline_keyboard] == ["dl:ubfile-1"]  # videos can't be downloaded
     docs, notes = [], []
 
     async def fake_doc(chat, doc, caption=None):
@@ -1307,28 +1305,3 @@ def test_every_handler_is_in_the_menu_and_on_the_keyboard(b):
     menu = {c for c, _ in b.MENU}
     assert handled == menu
     assert {k.text for row in b.KEYBOARD.keyboard for k in row} == {f"/{c}" for c in menu}
-
-
-async def test_tapping_a_file_title_sends_the_file(b, monkeypatch):
-    b.db.execute("DELETE FROM resources")
-    b.db.execute("INSERT INTO resources VALUES('ubfile-1','Lecture 1',?, 'ubfile','https://e/m',0)", (COURSE,))
-    docs, texts = [], []
-
-    async def fake_doc(chat, doc, caption=None):
-        docs.append(doc.filename)
-
-    monkeypatch.setattr(b.bot, "send_document", fake_doc)
-    monkeypatch.setattr(b, "download_resource", lambda url: [("l1.pdf", b"x")])
-
-    class M:
-        async def answer(self, text, **kw):
-            texts.append(text)
-
-    class Cmd:
-        args = "dl_ubfile-1"
-
-    await b.cmd_start(M(), Cmd())
-    assert docs == ["l1.pdf"] and "Downloading…" in texts and not any("eclass deadline bot" in t for t in texts)
-    Cmd.args = None
-    await b.cmd_start(M(), Cmd())
-    assert "eclass deadline bot" in texts[-1]  # a plain /start still shows the help

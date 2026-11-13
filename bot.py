@@ -738,19 +738,9 @@ def undated_line(row):
     return f"{ICON['done'] if status == 'done' else ICON['na']} {name} · {esc(short_course(course))}"
 
 
-BOT_USERNAME = None  # set at startup; makes file titles download links
-
-
-def download_link(uid):
-    """t.me link that opens this chat and makes the bot send the file (None until the bot's name is known)."""
-    return f"https://t.me/{BOT_USERNAME}?start=dl_{uid}" if BOT_USERNAME else None
-
-
 def res_line(row):
     uid, title, course, kind, url = row[:5]
-    link = download_link(uid) if kind in DOWNLOADABLE else None  # files and folders download; the rest open eclass
-    link = link or url
-    name = f'<a href="{esc(link)}">{esc(title)}</a>' if link else esc(title)
+    name = f'<a href="{esc(url)}">{esc(title)}</a>' if url else esc(title)
     return f"{RES_ICON.get(kind, '•')} {name}"
 
 
@@ -765,9 +755,22 @@ def render_resources(rows):
     return "\n".join(out)
 
 
+def download_keyboard(rows):
+    """One ⬇️ button per file or folder in rows; None if there is nothing to download."""
+    btns = [
+        [InlineKeyboardButton(text=f"⬇️ {clean_title(r[1])[:40]}", callback_data=f"dl:{r[0]}")]
+        for r in rows
+        if r[3] in DOWNLOADABLE
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=btns[:25]) if btns else None
+
+
 async def send_new_resources(rows):
     for i in range(0, len(rows), 25):  # stay under Telegram's message size limit
-        await bot.send_message(CHAT_ID, "📚 <b>New material</b>\n\n" + render_resources(rows[i : i + 25]), disable_notification=True)
+        chunk = rows[i : i + 25]
+        await bot.send_message(
+            CHAT_ID, "📚 <b>New material</b>\n\n" + render_resources(chunk), disable_notification=True, reply_markup=download_keyboard(chunk)
+        )
 
 
 def _filename(r):
@@ -1395,7 +1398,7 @@ MENU = [
     ("missed", "🕳 Deadlines that passed unsubmitted"),
     ("nodeadline", "♾ Work eclass gives no deadline for"),
     ("done", "✅ Mark handed in / mute (add a word to narrow)"),
-    ("resources", "📚 Course materials, tap a title to download (add a word to filter)"),
+    ("resources", "📚 Course materials, tap ⬇️ to download (add a word to filter)"),
     ("grades", "📊 Your grades (add a course for details)"),
     ("attendance", "🗓 Offline attendance (add a course for details)"),
     ("exams", "🎓 Midterm and final weeks (add a course to filter)"),
@@ -1423,7 +1426,7 @@ HELP = (
     "/nodeadline — assignments and quizzes with no deadline on eclass (e.g. Gradescope work); new ones are announced silently\n"
     f"/missed — deadlines of the last {MISSED_DAYS} days that passed without a submission\n"
     "/resources — latest course materials (files, videos, links). "
-    "Tap a file or folder title to get it here in Telegram; other items open eclass. Add a word to filter: <code>/resources database</code>\n"
+    "Tap ⬇️ under the list to get a file here in Telegram. Add a word to filter: <code>/resources database</code>\n"
     "/grades — your course totals. Add a word for the details of one course: <code>/grades database</code>\n"
     "/attendance — offline attendance of the courses that have it. Add a word for every class of one course: <code>/attendance operating</code>\n"
     "/exams — midterm and final weeks (with dates, weight and countdown), from the syllabi. Add a word to filter: <code>/exams database</code>\n"
@@ -1450,10 +1453,7 @@ HELP = (
 
 
 @dp.message(Command("start", "help"))
-async def cmd_start(m: Message, command: CommandObject):
-    if command.args and command.args.startswith("dl_"):  # a tapped file title: /start dl_<uid>
-        await send_resource(command.args[3:], m.answer)
-        return
+async def cmd_start(m: Message):
     await m.answer(HELP, reply_markup=KEYBOARD)
 
 
@@ -1489,6 +1489,12 @@ async def cmd_done(m: Message, command: CommandObject):
 @dp.callback_query(F.message.chat.id == CHAT_ID)
 async def on_action(q: CallbackQuery):
     action, _, uid = (q.data or "").partition(":")
+    if action == "dl":
+        async def progress(text):
+            await q.answer(text)
+
+        await send_resource(uid, progress)
+        return
     row = db.execute("SELECT title FROM events WHERE uid=?", (uid,)).fetchone()
     if action not in ("done", "mute", "undo") or not row:
         await q.answer("That item is gone")
@@ -1556,7 +1562,7 @@ async def cmd_resources(m: Message, command: CommandObject):
     # module ids grow over time, so a bigger id means added later
     rows = db.execute(q + " ORDER BY first_seen DESC, CAST(substr(uid, instr(uid,'-')+1) AS INTEGER) DESC LIMIT 15", args).fetchall()
     rows.sort(key=lambda r: r[2])  # group by course (stable, keeps newest-first inside each)
-    await m.answer(render_resources(rows) if rows else "No materials found")
+    await m.answer(render_resources(rows) if rows else "No materials found", reply_markup=download_keyboard(rows))
 
 
 @dp.message(Command("grades"))
@@ -1601,8 +1607,6 @@ async def cmd_status(m: Message):
 
 
 async def main():
-    global BOT_USERNAME
-    BOT_USERNAME = (await bot.get_me()).username
     await bot.set_my_commands([BotCommand(command=c, description=d) for c, d in MENU])
     asyncio.create_task(poll_loop())
     asyncio.create_task(reminder_loop())
