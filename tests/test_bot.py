@@ -11,6 +11,7 @@ from bot import (
     parse_activity_grade,
     parse_attendance,
     parse_messages,
+    parse_notifications,
     parse_notices,
     parse_due,
     parse_grade_report,
@@ -689,26 +690,32 @@ async def test_pages_are_fetched_once_per_cycle_and_fresh_the_next_time(b, monke
     assert len(fake.calls) == 5  # outside a cycle there is no cache
 
 
-async def test_overlapping_cycles_do_not_share_a_cache(b, monkeypatch):
+async def test_cycles_run_one_at_a_time_each_with_its_own_cache(b, monkeypatch):
     fake = FakeSession()
     monkeypatch.setattr(b, "_web", fake)
-    gate = asyncio.Event()
+    order, gate = [], asyncio.Event()
 
     async def slow():
         await asyncio.to_thread(b.web_get, "https://e/x")
+        order.append("slow-start")
         await gate.wait()
+        order.append("slow-end")
     slow.__name__ = "sync_events"
 
     async def quick():
+        order.append("quick-start")
         await asyncio.to_thread(b.web_get, "https://e/x")
     quick.__name__ = "sync_grades"
 
     first = asyncio.create_task(b.run_cycle([slow]))
     await asyncio.sleep(0.05)
-    await b.run_cycle([quick], alert=False)  # like /sync while a poll is running
+    second = asyncio.create_task(b.run_cycle([quick], alert=False))  # like /sync while a poll is running
+    await asyncio.sleep(0.05)
+    assert order == ["slow-start"] and not second.done()  # it waits its turn
     gate.set()
-    await first
-    assert fake.calls == ["https://e/x", "https://e/x"]  # /sync really re-read the page
+    await asyncio.gather(first, second)
+    assert order == ["slow-start", "slow-end", "quick-start"]
+    assert fake.calls == ["https://e/x", "https://e/x"]  # the second cycle really re-read the page
 
 
 # ---------- daily digest ----------
@@ -1078,3 +1085,173 @@ async def test_exam_reminder_when_first_seen_late_skips_the_older_one(b):
     await b.check_exam_reminders(now=at("2026-10-23", "09:00"))  # first look: already 1 day out
     await b.check_exam_reminders(now=at("2026-10-23", "10:00"))
     assert len(b.sent) == 1 and "1 day" in b.sent[0]
+
+
+# ---------- change watcher ----------
+def test_parse_notifications_real_page():
+    rows = parse_notifications(fixture("notifications.html"))
+    assert len(rows) == 15
+    uid, url, course, section = rows[0]
+    assert uid.startswith(("ubfile-", "assign-", "vod-", "folder-", "url-")) and url.endswith(uid.split("-")[1])
+    assert course == "Database[202602-SOC3020-001]" and section.startswith("10Week")
+    assert {r[0].split("-")[0] for r in rows} >= {"ubfile", "assign"}
+    assert parse_notifications("<p>Please log in</p>") is None
+    assert parse_notifications("<h3>Notification message</h3>") == []  # a real page with nothing in it
+
+
+async def test_watcher_scans_only_when_something_new_is_listed(b, monkeypatch):
+    b.db.execute("DELETE FROM notif_seen")
+    b.db.execute("DELETE FROM kv")
+    listed = [("ubfile-1", "u", "C", "1Week"), ("assign-2", "u", "C", "1Week")]
+    monkeypatch.setattr(b, "parse_notifications", lambda page: listed)
+    monkeypatch.setattr(b, "web_get", lambda url, **kw: type("R", (), {"text": ""})())
+    scans = []
+
+    async def fake_events():
+        scans.append(1)
+    fake_events.__name__ = "sync_events"
+    monkeypatch.setattr(b, "sync_events", fake_events)
+
+    await b.watch_changes()
+    assert scans == []  # the first look only records what is listed
+    await b.watch_changes()
+    assert scans == []  # nothing new
+    listed.insert(0, ("ubfile-3", "u", "C", "2Week"))
+    await b.watch_changes()
+    assert scans == [1]  # something new: scan now
+    await b.watch_changes()
+    assert scans == [1]  # and it is not new any more
+
+
+async def test_watcher_retries_when_the_scan_fails(b, monkeypatch):
+    b.db.execute("DELETE FROM notif_seen")
+    b.db.execute("DELETE FROM kv")
+    listed = [("ubfile-1", "u", "C", "1Week")]
+    monkeypatch.setattr(b, "parse_notifications", lambda page: listed)
+    monkeypatch.setattr(b, "web_get", lambda url, **kw: type("R", (), {"text": ""})())
+    outcomes = [ValueError("eclass hiccup"), None]
+
+    async def flaky_events():
+        if (e := outcomes.pop(0)):
+            raise e
+    flaky_events.__name__ = "sync_events"
+    monkeypatch.setattr(b, "sync_events", flaky_events)
+
+    await b.watch_changes()  # first look: records
+    listed.append(("assign-9", "u", "C", "1Week"))
+    await b.watch_changes()  # the scan fails: the new item stays unseen
+    assert b.db.execute("SELECT COUNT(*) FROM notif_seen WHERE uid='assign-9'").fetchone()[0] == 0
+    await b.watch_changes()  # the next check tries again and succeeds
+    assert b.db.execute("SELECT COUNT(*) FROM notif_seen WHERE uid='assign-9'").fetchone()[0] == 1
+    assert outcomes == []
+
+
+async def test_watch_loop_skips_a_tick_while_a_cycle_is_running(b, monkeypatch):
+    cycles = []
+
+    async def fake_cycle(jobs, alert=True):
+        cycles.append([j.__name__ for j in jobs])
+    monkeypatch.setattr(b, "run_cycle", fake_cycle)
+    sleeps = []
+
+    async def fake_sleep(secs):
+        sleeps.append(secs)
+        if len(sleeps) == 2:
+            b._cycle_lock.release()  # the running cycle ends before the second tick
+        if len(sleeps) == 3:
+            raise asyncio.CancelledError
+    monkeypatch.setattr(b.asyncio, "sleep", fake_sleep)
+    await b._cycle_lock.acquire()  # a full cycle is running during the first tick
+    with pytest.raises(asyncio.CancelledError):
+        await b.watch_loop()
+    assert cycles == [["sync_inbox", "watch_changes"]] and sleeps == [b.WATCH_MINUTES * 60] * 3
+
+
+class FakeResp:
+    def __init__(self, url, body=b"", ctype="application/pdf", headers=None, status=200):
+        self.url, self.status_code, self.ok = url, status, status < 400
+        self.headers = {"content-type": ctype, **(headers or {})}
+        self.content = body
+        self.text = body.decode("utf8", "ignore")
+
+    def iter_content(self, n):
+        yield self.content
+
+    def close(self):
+        pass
+
+
+def test_download_serves_file_directly(b, monkeypatch):
+    r = FakeResp("https://e/pluginfile.php/1/l1.pdf", b"%PDF", headers={"content-disposition": 'attachment; filename="Lecture 1.pdf"'})
+    monkeypatch.setattr(b, "_fetch", lambda url: r)
+    assert b.download_resource("https://e/mod/ubfile/view.php?id=1") == [("Lecture 1.pdf", b"%PDF")]
+
+
+def test_download_follows_links_on_a_page_and_skips_other_links(b, monkeypatch):
+    page = '<a href="/pluginfile.php/9/a.pdf">a</a><a href="/pluginfile.php/9/b.pptx?forcedownload=1">b</a><a href="/course/view.php?id=2">x</a>'
+    pages = {
+        "https://e/mod/folder/view.php?id=5": FakeResp("https://e/mod/folder/view.php?id=5", page.encode(), "text/html; charset=utf-8"),
+        "https://e/pluginfile.php/9/a.pdf": FakeResp("https://e/pluginfile.php/9/a.pdf", b"A"),
+        "https://e/pluginfile.php/9/b.pptx?forcedownload=1": FakeResp("https://e/pluginfile.php/9/b.pptx", b"B"),
+    }
+    monkeypatch.setattr(b, "_fetch", lambda url: pages[url])
+    assert b.download_resource("https://e/mod/folder/view.php?id=5") == [("a.pdf", b"A"), ("b.pptx", b"B")]
+
+
+def test_download_refuses_oversized_and_empty_pages(b, monkeypatch):
+    big = FakeResp("https://e/f.zip", b"x", headers={"content-length": str(b.MAX_UPLOAD + 1)})
+    monkeypatch.setattr(b, "_fetch", lambda url: big)
+    with pytest.raises(ValueError, match="50 MB"):
+        b.download_resource("https://e/m")
+    monkeypatch.setattr(b, "_fetch", lambda url: FakeResp(url, b"<p>nothing</p>", "text/html"))
+    with pytest.raises(ValueError, match="no file"):
+        b.download_resource("https://e/m")
+
+
+async def test_download_button_sends_document(b, monkeypatch):
+    b.db.execute("DELETE FROM resources")
+    b.db.execute("INSERT INTO resources VALUES('ubfile-1','Lecture 1',?, 'ubfile','https://e/m',0)", (COURSE,))
+    b.db.execute("INSERT INTO resources VALUES('vod-2','Video',?, 'vod','https://e/v',0)", (COURSE,))
+    rows = b.db.execute("SELECT uid,title,course,kind,url FROM resources").fetchall()
+    kb = b.download_keyboard(rows)
+    assert [r[0].callback_data for r in kb.inline_keyboard] == ["dl:ubfile-1"]  # videos can't be downloaded
+    docs, notes = [], []
+
+    async def fake_doc(chat, doc, caption=None):
+        docs.append((doc.filename, caption))
+
+    async def answer(text):
+        notes.append(text)
+
+    monkeypatch.setattr(b.bot, "send_document", fake_doc)
+    monkeypatch.setattr(b, "download_resource", lambda url: [("l1.pdf", b"x")])
+    await b.send_resource("ubfile-1", answer)
+    assert docs == [("l1.pdf", "Lecture 1")]
+    await b.send_resource("nope", answer)
+    assert notes[-1] == "That item is gone"
+
+
+async def test_download_failure_tells_you_instead_of_crashing(b, monkeypatch):
+    b.db.execute("DELETE FROM resources")
+    b.db.execute("INSERT INTO resources VALUES('ubfile-1','Lecture 1',?, 'ubfile','https://e/m',0)", (COURSE,))
+
+    def boom(url):
+        raise OSError("net down")
+
+    monkeypatch.setattr(b, "download_resource", boom)
+
+    async def answer(text):
+        pass
+
+    await b.send_resource("ubfile-1", answer)
+    assert "Could not download" in b.sent[-1]
+
+
+def test_every_handler_is_in_the_menu_and_on_the_keyboard(b):
+    import re
+
+    src = Path(b.__file__).read_text()
+    handled = {c for grp in re.findall(r'Command\(([^)]*)\)', src) for c in re.findall(r'"(\w+)"', grp)} - {"start"}
+    menu = {c for c, _ in b.MENU}
+    assert handled == menu
+    assert {k.text for row in b.KEYBOARD.keyboard for k in row} == {f"/{c}" for c in menu}

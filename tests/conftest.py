@@ -1,3 +1,4 @@
+import asyncio
 import os
 import sys
 from pathlib import Path
@@ -32,8 +33,10 @@ def b(monkeypatch):
     botmod.db.execute("DELETE FROM attendance")
     botmod.db.execute("DELETE FROM health")
     botmod.db.execute("DELETE FROM inbox")
+    botmod.db.execute("DELETE FROM notif_seen")
     botmod.db.execute("DELETE FROM undated")
     botmod.db.execute("DELETE FROM kv")
+    botmod._cycle_lock = asyncio.Lock()  # a lock binds to the first event loop that waits on it
     botmod.sent = sent
     botmod.sent_kw = sent_kw
     return botmod

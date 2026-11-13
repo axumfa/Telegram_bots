@@ -6,8 +6,9 @@ import logging
 import os
 import re
 import sqlite3
+from email.message import Message as _EmailMessage
 from datetime import date, datetime, time as dtime, timedelta, timezone
-from urllib.parse import urlparse
+from urllib.parse import unquote, urljoin, urlparse
 from zoneinfo import ZoneInfo
 
 import requests
@@ -17,6 +18,7 @@ from aiogram.enums import ParseMode
 from aiogram.filters import Command, CommandObject
 from aiogram.types import (
     BotCommand,
+    BufferedInputFile,
     CallbackQuery,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
@@ -33,7 +35,8 @@ CHAT_ID = int(os.environ["CHAT_ID"])
 MOODLE_URL = os.getenv("MOODLE_URL", "https://eclass.inha.ac.kr").rstrip("/")
 ECLASS_USERNAME = os.getenv("ECLASS_USERNAME", "")
 ECLASS_PASSWORD = os.getenv("ECLASS_PASSWORD", "")
-POLL_MINUTES = int(os.getenv("POLL_MINUTES", "20"))
+POLL_MINUTES = int(os.getenv("POLL_MINUTES", "20"))  # a full refresh at least this often
+WATCH_MINUTES = int(os.getenv("WATCH_MINUTES", "5"))  # light check for new things; 0 = off
 GRADES_EVERY = 3  # check grades on every 3rd poll
 RECHECK_DAYS = 2  # keep re-reading an unsubmitted item this long after its deadline (last-minute and late submissions)
 MISSED_DAYS = 30  # /missed looks back this far
@@ -62,6 +65,9 @@ INBOX_LABEL = {"feedback": "Feedback", "announcement": "Announcement", "urgent":
 INBOX_LOUD = ("feedback", "announcement", "urgent")  # these ping; plain messages arrive silently
 URGENT_RE = re.compile(r"urgent|\basap\b|cancel|postpone|reschedul|campus is closed|(?:don'?t|do not) come|no class|휴강|보강|취소|긴급|연기", re.I)
 EXAM_KINDS = {"midterm": ("Midterm", "📝"), "final": ("Final", "🏁")}
+DOWNLOADABLE = ("ubfile", "folder")  # resources the bot can fetch from eclass and send as files
+MAX_UPLOAD = 50 * 1024 * 1024  # Telegram's limit for a file a bot sends
+MAX_FOLDER_FILES = 10
 RES_ICON = {"ubfile": "📄", "vod": "🎥", "folder": "📁", "url": "🔗", "page": "📝"}  # course items that need no submission
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -81,6 +87,7 @@ db.executescript(
     CREATE TABLE IF NOT EXISTS health(job TEXT PRIMARY KEY, last_ok INTEGER, last_err TEXT, fails INTEGER NOT NULL DEFAULT 0, alerted INTEGER NOT NULL DEFAULT 0);
     CREATE TABLE IF NOT EXISTS undated(uid TEXT PRIMARY KEY, title TEXT, course TEXT, kind TEXT, url TEXT, status TEXT, first_seen INTEGER);
     CREATE TABLE IF NOT EXISTS exams(cid TEXT, course TEXT, kind TEXT, week INTEGER, start TEXT, end TEXT, weight TEXT, PRIMARY KEY(cid, kind));
+    CREATE TABLE IF NOT EXISTS notif_seen(uid TEXT PRIMARY KEY);
     CREATE TABLE IF NOT EXISTS kv(key TEXT PRIMARY KEY, value TEXT);
     CREATE TABLE IF NOT EXISTS inbox(uid TEXT PRIMARY KEY, kind TEXT, course TEXT, sender TEXT, ts TEXT, title TEXT, url TEXT, preview TEXT);
     CREATE TABLE IF NOT EXISTS attendance(uid TEXT PRIMARY KEY, course TEXT, day TEXT, cls TEXT, status TEXT);
@@ -592,6 +599,28 @@ def parse_notices(page):
     return out
 
 
+def parse_notifications(page):
+    """[(uid 'kind-id', url, course, section)] from the Notifications page ('New File has been added', ...), newest first.
+
+    The uid is the same 'ubfile-73517' / 'assign-71244' key the bot uses for those activities. None if this isn't
+    the notifications page.
+    """
+    soup = BeautifulSoup(page, "html.parser")
+    if "Notification message" not in soup.get_text():
+        return None
+    out = []
+    for media in soup.select("div.media"):
+        a = media.select_one("a[href*='/mod/']")
+        m = a and re.search(r"/mod/(\w+)/view\.php\?id=(\d+)", a["href"])
+        head = media.select_one("h4")
+        if not (m and head):
+            continue
+        section = head.select_one(".sectionname")
+        course = head.get_text(" ", strip=True).split(" - ")[0]
+        out.append((f"{m.group(1)}-{m.group(2)}", a["href"], course, section.get_text(strip=True) if section else ""))
+    return out
+
+
 def scrape_inbox():
     """{'msg': [...], 'notice': [...]} for the inbox pages that could be read. Blocking."""
     out = {}
@@ -713,9 +742,120 @@ def render_resources(rows):
     return "\n".join(out)
 
 
+def download_keyboard(rows):
+    """One ⬇️ button per file or folder in rows; None if there is nothing to download."""
+    btns = [
+        [InlineKeyboardButton(text=f"⬇️ {clean_title(r[1])[:40]}", callback_data=f"dl:{r[0]}")]
+        for r in rows
+        if r[3] in DOWNLOADABLE
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=btns[:25]) if btns else None
+
+
 async def send_new_resources(rows):
     for i in range(0, len(rows), 25):  # stay under Telegram's message size limit
-        await bot.send_message(CHAT_ID, "📚 <b>New material</b>\n\n" + render_resources(rows[i : i + 25]), disable_notification=True)
+        chunk = rows[i : i + 25]
+        await bot.send_message(
+            CHAT_ID, "📚 <b>New material</b>\n\n" + render_resources(chunk), disable_notification=True, reply_markup=download_keyboard(chunk)
+        )
+
+
+def _filename(r):
+    """File name from Content-Disposition, else from the URL."""
+    msg = _EmailMessage()
+    msg["content-disposition"] = r.headers.get("content-disposition", "")
+    name = msg.get_filename() or unquote(urlparse(r.url).path.rsplit("/", 1)[-1])
+    return re.sub(r"[\\/:*?\"<>|\x00-\x1f]", "_", name).strip() or "file"
+
+
+def _fetch(url):
+    """GET url with the eclass session, streaming; logs in again if the session expired. Blocking."""
+    if _web is None:
+        web_login()
+    r = _web.get(url, timeout=60, stream=True)
+    if _is_login_path(r):
+        r.close()
+        web_login()
+        r = _web.get(url, timeout=60, stream=True)
+    return r
+
+
+def _is_login_path(r):
+    return "login" in urlparse(r.url).path
+
+
+def _read_file(r):
+    """(name, bytes) of a non-HTML response, refusing anything over Telegram's limit. Blocking."""
+    try:
+        if int(r.headers.get("content-length") or 0) > MAX_UPLOAD:
+            raise ValueError(f"{_filename(r)} is over 50 MB, too big for Telegram: open it on eclass")
+        data = bytearray()
+        for chunk in r.iter_content(1 << 16):
+            data += chunk
+            if len(data) > MAX_UPLOAD:
+                raise ValueError(f"{_filename(r)} is over 50 MB, too big for Telegram: open it on eclass")
+        return _filename(r), bytes(data)
+    finally:
+        r.close()
+
+
+def file_links(page, base):
+    """Download links on an eclass module page (Moodle 'pluginfile' / download links), in order, without repeats."""
+    seen, out = set(), []
+    for a in BeautifulSoup(page, "html.parser").find_all("a", href=True):
+        href = urljoin(base, a["href"])
+        if ("pluginfile.php" in href or "forcedownload" in href or "/download" in href) and href not in seen:
+            seen.add(href)
+            out.append(href)
+    return out
+
+
+def download_resource(url):
+    """[(name, bytes)] for an eclass file or folder page. Blocking.
+
+    The module link either serves the file itself or shows a page that links to it.
+    """
+    r = _fetch(url)
+    if not r.ok:
+        r.close()
+        raise ValueError(f"eclass answered {r.status_code}")
+    if "text/html" not in r.headers.get("content-type", ""):
+        return [_read_file(r)]
+    page, base = r.text, r.url
+    links = file_links(page, base)
+    if not links:
+        raise ValueError("no file found on that page: open it on eclass")
+    files = []
+    for link in links[:MAX_FOLDER_FILES]:
+        f = _fetch(link)
+        if not f.ok or "text/html" in f.headers.get("content-type", ""):
+            f.close()
+            continue
+        files.append(_read_file(f))
+    if not files:
+        raise ValueError("no file found on that page: open it on eclass")
+    return files
+
+
+async def send_resource(uid, answer):
+    """Fetch resource uid from eclass and send it to the chat. answer(text) shows progress or a failure."""
+    row = db.execute("SELECT title,url,kind FROM resources WHERE uid=?", (uid,)).fetchone()
+    if not row or row[2] not in DOWNLOADABLE:
+        await answer("That item is gone")
+        return
+    title, url, _ = row
+    await answer("Downloading…")
+    try:
+        files = await asyncio.to_thread(download_resource, url)
+    except ValueError as e:
+        await bot.send_message(CHAT_ID, f"⚠️ {esc(title)}: {esc(str(e))}")
+        return
+    except Exception as e:
+        log.warning("download %s failed: %s", uid, e)
+        await bot.send_message(CHAT_ID, f"⚠️ Could not download {esc(title)} ({esc(type(e).__name__)}). Open it on eclass: {esc(url)}")
+        return
+    for name, data in files:
+        await bot.send_document(CHAT_ID, BufferedInputFile(data, filename=name), caption=esc(clean_title(title))[:1000])
 
 
 def item_row(uid, title, state=None):
@@ -952,6 +1092,7 @@ JOB_LABEL = {
     "check_reminders": "reminders",
     "check_digest": "daily digest",
     "sync_exams": "exam weeks",
+    "watch_changes": "change watcher",
     "check_exam_reminders": "exam reminders",
 }
 
@@ -1000,16 +1141,48 @@ async def run_job(job, alert=True):
     return None
 
 
+_cycle_lock = asyncio.Lock()  # one cycle at a time: a poll, the watcher and /sync never process the same changes twice
+
+
 async def run_cycle(jobs, alert=True):
     """run_job for each job in turn, sharing one page cache so the jobs don't fetch the same eclass page again.
 
-    The cache lives only for this call, so every poll and every /sync reads fresh pages.
+    The cache lives only for this call, so every poll and every /sync reads fresh pages. Cycles queue up.
     """
-    token = _page_cache.set({})
-    try:
-        return [await run_job(job, alert) for job in jobs]
-    finally:
-        _page_cache.reset(token)
+    async with _cycle_lock:
+        token = _page_cache.set({})
+        try:
+            return [await run_job(job, alert) for job in jobs]
+        finally:
+            _page_cache.reset(token)
+
+
+async def watch_changes():
+    """Light check: if eclass lists something new (file, assignment, video ...) that we haven't seen, scan deadlines now.
+
+    The Notifications page is one request; the full scan costs about 50. The first look only records what is listed.
+    """
+    items = await asyncio.to_thread(lambda: parse_notifications(web_get(f"{MOODLE_URL}/local/ubnotification/").text))
+    if items is None:
+        log.warning("notifications page not recognised")
+        return
+    seen = {r[0] for r in db.execute("SELECT uid FROM notif_seen")}
+    first = not db.execute("SELECT 1 FROM kv WHERE key='notif_seen_init'").fetchone()
+    if [i for i in items if i[0] not in seen] and not first:
+        log.info("eclass lists something new: scanning now")
+        if await run_job(sync_events):  # failed: leave them unseen so the next check tries again
+            return
+    db.executemany("INSERT OR IGNORE INTO notif_seen VALUES(?)", [(i[0],) for i in items])
+    db.execute("INSERT OR IGNORE INTO kv VALUES('notif_seen_init','1')")
+    db.commit()
+
+
+async def watch_loop():
+    """Every WATCH_MINUTES: the inbox, and the notifications page. Skipped while a full cycle is running."""
+    while True:
+        await asyncio.sleep(WATCH_MINUTES * 60)
+        if not _cycle_lock.locked():
+            await run_cycle([sync_inbox, watch_changes])
 
 
 async def poll_loop():
@@ -1177,29 +1350,28 @@ def render_inbox(rows):
 
 
 MENU = [
-    ("upcoming", "Next 15 deadlines"),
-    ("today", "Due in the next 24 hours"),
-    ("week", "Due until the end of next Sunday"),
-    ("missed", "Deadlines that passed unsubmitted"),
-    ("nodeadline", "Work eclass gives no deadline for"),
-    ("done", "Mark something as handed in / mute it"),
-    ("resources", "Latest course materials"),
-    ("grades", "Your grades"),
-    ("attendance", "Your offline attendance"),
-    ("inbox", "Latest messages and notices"),
-    ("exams", "Midterm and final weeks"),
-    ("sync", "Refresh from eclass now"),
-    ("status", "Is the bot working?"),
-    ("help", "What this bot does"),
+    ("upcoming", "⏳ Next 15 deadlines"),
+    ("today", "🔥 Due in the next 24 hours"),
+    ("week", "📅 Due until the end of next Sunday"),
+    ("missed", "🕳 Deadlines that passed unsubmitted"),
+    ("nodeadline", "♾ Work eclass gives no deadline for"),
+    ("done", "✅ Mark handed in / mute (add a word to narrow)"),
+    ("resources", "📚 Course materials, tap ⬇️ to download (add a word to filter)"),
+    ("grades", "📊 Your grades (add a course for details)"),
+    ("attendance", "🗓 Offline attendance (add a course for details)"),
+    ("exams", "🎓 Midterm and final weeks (add a course to filter)"),
+    ("inbox", "💬 Latest messages and notices (add a word to filter)"),
+    ("sync", "🔄 Refresh from eclass now"),
+    ("status", "🩺 Is the bot working?"),
+    ("help", "❓ What this bot does"),
 ]
+# the reply keyboard shows every menu command, four to a row
+_btns = [KeyboardButton(text=f"/{c}") for c, _ in MENU]
 KEYBOARD = ReplyKeyboardMarkup(
-    keyboard=[
-        [KeyboardButton(text="/upcoming"), KeyboardButton(text="/today"), KeyboardButton(text="/week"), KeyboardButton(text="/missed")],
-        [KeyboardButton(text="/resources"), KeyboardButton(text="/grades"), KeyboardButton(text="/attendance"), KeyboardButton(text="/exams")],
-        [KeyboardButton(text="/inbox"), KeyboardButton(text="/sync"), KeyboardButton(text="/status"), KeyboardButton(text="/help")],
-    ],
+    keyboard=[_btns[i : i + 4] for i in range(0, len(_btns), 4)],
     resize_keyboard=True,
     is_persistent=True,
+    input_field_placeholder="Pick a command, or type e.g. /resources database",
 )
 HELP = (
     "<b>eclass deadline bot</b>\n"
@@ -1212,7 +1384,7 @@ HELP = (
     "/nodeadline — assignments and quizzes with no deadline on eclass (e.g. Gradescope work); new ones are announced silently\n"
     f"/missed — deadlines of the last {MISSED_DAYS} days that passed without a submission\n"
     "/resources — latest course materials (files, videos, links). "
-    "Add a word to filter: <code>/resources database</code>\n"
+    "Tap ⬇️ under the list to get a file here in Telegram. Add a word to filter: <code>/resources database</code>\n"
     "/grades — your course totals. Add a word for the details of one course: <code>/grades database</code>\n"
     "/attendance — offline attendance of the courses that have it. Add a word for every class of one course: <code>/attendance operating</code>\n"
     "/exams — midterm and final weeks (with dates, weight and countdown), from the syllabi. Add a word to filter: <code>/exams database</code>\n"
@@ -1275,6 +1447,12 @@ async def cmd_done(m: Message, command: CommandObject):
 @dp.callback_query(F.message.chat.id == CHAT_ID)
 async def on_action(q: CallbackQuery):
     action, _, uid = (q.data or "").partition(":")
+    if action == "dl":
+        async def progress(text):
+            await q.answer(text)
+
+        await send_resource(uid, progress)
+        return
     row = db.execute("SELECT title FROM events WHERE uid=?", (uid,)).fetchone()
     if action not in ("done", "mute", "undo") or not row:
         await q.answer("That item is gone")
@@ -1342,7 +1520,7 @@ async def cmd_resources(m: Message, command: CommandObject):
     # module ids grow over time, so a bigger id means added later
     rows = db.execute(q + " ORDER BY first_seen DESC, CAST(substr(uid, instr(uid,'-')+1) AS INTEGER) DESC LIMIT 15", args).fetchall()
     rows.sort(key=lambda r: r[2])  # group by course (stable, keeps newest-first inside each)
-    await m.answer(render_resources(rows) if rows else "No materials found")
+    await m.answer(render_resources(rows) if rows else "No materials found", reply_markup=download_keyboard(rows))
 
 
 @dp.message(Command("grades"))
@@ -1390,6 +1568,8 @@ async def main():
     await bot.set_my_commands([BotCommand(command=c, description=d) for c, d in MENU])
     asyncio.create_task(poll_loop())
     asyncio.create_task(reminder_loop())
+    if WATCH_MINUTES > 0:
+        asyncio.create_task(watch_loop())
     await dp.start_polling(bot)
 
 
