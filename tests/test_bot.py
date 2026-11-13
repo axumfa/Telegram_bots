@@ -1151,6 +1151,7 @@ async def test_watch_loop_skips_a_tick_while_a_cycle_is_running(b, monkeypatch):
 
     async def fake_cycle(jobs, alert=True):
         cycles.append([j.__name__ for j in jobs])
+        return [None] * len(jobs)
     monkeypatch.setattr(b, "run_cycle", fake_cycle)
     sleeps = []
 
@@ -1164,7 +1165,56 @@ async def test_watch_loop_skips_a_tick_while_a_cycle_is_running(b, monkeypatch):
     await b._cycle_lock.acquire()  # a full cycle is running during the first tick
     with pytest.raises(asyncio.CancelledError):
         await b.watch_loop()
-    assert cycles == [["sync_inbox", "watch_changes"]] and sleeps == [b.WATCH_MINUTES * 60] * 3
+    assert cycles == [["watch_changes"]] and sleeps == [b.WATCH_SECONDS] * 3
+
+
+async def test_watch_loop_reads_the_inbox_only_on_the_slow_rhythm(b, monkeypatch):
+    cycles, clock = [], [1000.0]
+
+    async def fake_cycle(jobs, alert=True):
+        cycles.append([j.__name__ for j in jobs])
+        return [None] * len(jobs)
+
+    async def fake_sleep(secs):
+        clock[0] += secs
+        if len(cycles) == 12:
+            raise asyncio.CancelledError
+    monkeypatch.setattr(b, "run_cycle", fake_cycle)
+    monkeypatch.setattr(b.asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr(b.time, "monotonic", lambda: clock[0])
+    with pytest.raises(asyncio.CancelledError):
+        await b.watch_loop()
+    with_inbox = [i for i, c in enumerate(cycles) if "sync_inbox" in c]
+    assert with_inbox and with_inbox[0] >= 3  # not on every fast tick
+    assert all(c[-1] == "watch_changes" for c in cycles)
+    assert len(with_inbox) < len(cycles) / 2
+
+
+def test_watch_interval_has_a_floor_of_30_seconds(b):
+    assert [b.watch_interval(x) for x in ("60", "10", "1", "0", "90", "30")] == [60, 30, 30, 0, 90, 30]
+    assert b.WATCH_SECONDS == 60  # the default
+
+
+def test_watch_backs_off_when_slow_or_failing_and_recovers(b):
+    base = b.WATCH_SECONDS
+    assert b.next_watch_delay(base, 0.4, False) == base
+    d = b.next_watch_delay(base, b.WATCH_SLOW + 1, False)  # slow response
+    assert d == base * 2
+    d = b.next_watch_delay(d, 0.4, True)  # still failing
+    assert d == base * 4
+    for _ in range(10):
+        d = b.next_watch_delay(d, 30, False)
+    assert d == b.WATCH_MAX_SECONDS  # capped
+    assert b.next_watch_delay(d, 0.4, False) == base  # fast again
+
+
+async def test_status_shows_the_watcher_rate_and_backoff(b):
+    now = int(__import__("time").time())
+    b.db.execute("INSERT OR REPLACE INTO health(job,last_ok,fails,alerted) VALUES('watch_changes',?,0,0)", (now,))
+    b._watch_state["delay"] = b.WATCH_SECONDS
+    assert f"change watcher · last ok just now · every {b.WATCH_SECONDS}s" in b.render_status()
+    b._watch_state["delay"] = b.WATCH_SECONDS * 4
+    assert "backing off" in b.render_status()
 
 
 class FakeResp:

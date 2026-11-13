@@ -6,6 +6,7 @@ import logging
 import os
 import re
 import sqlite3
+import time
 from email.message import Message as _EmailMessage
 from datetime import date, datetime, time as dtime, timedelta, timezone
 from urllib.parse import unquote, urljoin, urlparse
@@ -36,7 +37,19 @@ MOODLE_URL = os.getenv("MOODLE_URL", "https://eclass.inha.ac.kr").rstrip("/")
 ECLASS_USERNAME = os.getenv("ECLASS_USERNAME", "")
 ECLASS_PASSWORD = os.getenv("ECLASS_PASSWORD", "")
 POLL_MINUTES = int(os.getenv("POLL_MINUTES", "20"))  # a full refresh at least this often
-WATCH_MINUTES = int(os.getenv("WATCH_MINUTES", "5"))  # light check for new things; 0 = off
+WATCH_MIN_SECONDS = 30  # never poll the Notifications page faster than this: eclass may rate-limit or block the account
+
+
+def watch_interval(raw):
+    """WATCH_SECONDS: seconds between light checks for new things; below the minimum is raised to it, 0 = off."""
+    n = int(raw)
+    return max(WATCH_MIN_SECONDS, n) if n > 0 else 0
+
+
+WATCH_SECONDS = watch_interval(os.getenv("WATCH_SECONDS", "60"))
+WATCH_INBOX_SECONDS = 300  # the (costlier) inbox is read on this slower rhythm
+WATCH_SLOW = 5.0  # a Notifications page that takes longer than this (seconds) makes the watcher back off
+WATCH_MAX_SECONDS = 600  # ...up to this long between checks
 GRADES_EVERY = 3  # check grades on every 3rd poll
 RECHECK_DAYS = 2  # keep re-reading an unsubmitted item this long after its deadline (last-minute and late submissions)
 MISSED_DAYS = 30  # /missed looks back this far
@@ -1157,12 +1170,26 @@ async def run_cycle(jobs, alert=True):
             _page_cache.reset(token)
 
 
+_watch_state = {"delay": WATCH_SECONDS, "fetch": 0.0}  # current wait between checks, last Notifications fetch time
+
+
+def next_watch_delay(delay, fetch_secs, failed):
+    """Back off (double, up to WATCH_MAX_SECONDS) while eclass is slow or failing; back to normal once it is fast again."""
+    if failed or fetch_secs > WATCH_SLOW:
+        return min(max(delay, WATCH_SECONDS) * 2, WATCH_MAX_SECONDS)
+    return WATCH_SECONDS
+
+
 async def watch_changes():
     """Light check: if eclass lists something new (file, assignment, video ...) that we haven't seen, scan deadlines now.
 
     The Notifications page is one request; the full scan costs about 50. The first look only records what is listed.
     """
-    items = await asyncio.to_thread(lambda: parse_notifications(web_get(f"{MOODLE_URL}/local/ubnotification/").text))
+    t0 = time.monotonic()
+    try:
+        items = await asyncio.to_thread(lambda: parse_notifications(web_get(f"{MOODLE_URL}/local/ubnotification/").text))
+    finally:
+        _watch_state["fetch"] = time.monotonic() - t0
     if items is None:
         log.warning("notifications page not recognised")
         return
@@ -1178,11 +1205,23 @@ async def watch_changes():
 
 
 async def watch_loop():
-    """Every WATCH_MINUTES: the inbox, and the notifications page. Skipped while a full cycle is running."""
+    """Every WATCH_SECONDS: the Notifications page; every WATCH_INBOX_SECONDS also the inbox.
+
+    Skipped while a full cycle is running. Waits longer (backs off) while eclass is slow or failing.
+    """
+    delay, last_inbox = WATCH_SECONDS, time.monotonic()
     while True:
-        await asyncio.sleep(WATCH_MINUTES * 60)
-        if not _cycle_lock.locked():
-            await run_cycle([sync_inbox, watch_changes])
+        _watch_state["delay"] = delay
+        await asyncio.sleep(delay)
+        if _cycle_lock.locked():
+            continue
+        jobs = [watch_changes]
+        if time.monotonic() - last_inbox >= WATCH_INBOX_SECONDS:
+            jobs.insert(0, sync_inbox)
+            last_inbox = time.monotonic()
+        _watch_state["fetch"] = 0.0
+        results = await run_cycle(jobs)
+        delay = next_watch_delay(delay, _watch_state["fetch"], any(results))
 
 
 async def poll_loop():
@@ -1271,6 +1310,9 @@ def render_status():
             out.append(f"❌ {label} · failing ×{fails} · {when}\n    <i>{esc(err)[:200]}</i>")
         else:
             out.append(f"✅ {label} · {when}")
+        if name == "watch_changes" and WATCH_SECONDS:
+            d = int(_watch_state["delay"])
+            out[-1] += f" · every {d}s" + (" (slow: backing off)" if d > WATCH_SECONDS else "")
     counts = [(t, db.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]) for t in ("events", "resources", "grades", "attendance")]
     out.append("\n" + " · ".join(f"{n} {t}" for t, n in counts))
     return "\n".join(out)
@@ -1568,7 +1610,7 @@ async def main():
     await bot.set_my_commands([BotCommand(command=c, description=d) for c, d in MENU])
     asyncio.create_task(poll_loop())
     asyncio.create_task(reminder_loop())
-    if WATCH_MINUTES > 0:
+    if WATCH_SECONDS > 0:
         asyncio.create_task(watch_loop())
     await dp.start_polling(bot)
 
