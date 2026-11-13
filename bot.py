@@ -756,9 +756,9 @@ def render_resources(rows):
 
 
 def download_keyboard(rows):
-    """One ⬇️ button per file or folder in rows; None if there is nothing to download."""
+    """One button (titled with the file) per file or folder in rows; None if there is nothing to download."""
     btns = [
-        [InlineKeyboardButton(text=f"⬇️ {clean_title(r[1])[:40]}", callback_data=f"dl:{r[0]}")]
+        [InlineKeyboardButton(text=clean_title(r[1])[:60], callback_data=f"dl:{r[0]}")]
         for r in rows
         if r[3] in DOWNLOADABLE
     ]
@@ -857,6 +857,7 @@ async def send_resource(uid, answer):
         await answer("That item is gone")
         return
     title, url, _ = row
+    log.info("download %s requested", uid)
     await answer("Downloading…")
     try:
         files = await asyncio.to_thread(download_resource, url)
@@ -867,6 +868,7 @@ async def send_resource(uid, answer):
         log.warning("download %s failed: %s", uid, e)
         await bot.send_message(CHAT_ID, f"⚠️ Could not download {esc(title)} ({esc(type(e).__name__)}). Open it on eclass: {esc(url)}")
         return
+    log.info("download %s: sending %d file(s)", uid, len(files))
     for name, data in files:
         await bot.send_document(CHAT_ID, BufferedInputFile(data, filename=name), caption=esc(clean_title(title))[:1000])
 
@@ -1398,7 +1400,7 @@ MENU = [
     ("missed", "🕳 Deadlines that passed unsubmitted"),
     ("nodeadline", "♾ Work eclass gives no deadline for"),
     ("done", "✅ Mark handed in / mute (add a word to narrow)"),
-    ("resources", "📚 Course materials, tap ⬇️ to download (add a word to filter)"),
+    ("resources", "📚 Course materials, tap a button to download (add a word to filter)"),
     ("grades", "📊 Your grades (add a course for details)"),
     ("attendance", "🗓 Offline attendance (add a course for details)"),
     ("exams", "🎓 Midterm and final weeks (add a course to filter)"),
@@ -1426,7 +1428,7 @@ HELP = (
     "/nodeadline — assignments and quizzes with no deadline on eclass (e.g. Gradescope work); new ones are announced silently\n"
     f"/missed — deadlines of the last {MISSED_DAYS} days that passed without a submission\n"
     "/resources — latest course materials (files, videos, links). "
-    "Tap ⬇️ under the list to get a file here in Telegram. Add a word to filter: <code>/resources database</code>\n"
+    "Tap a file's button under the list to get it here in Telegram. Add a word to filter: <code>/resources database</code>\n"
     "/grades — your course totals. Add a word for the details of one course: <code>/grades database</code>\n"
     "/attendance — offline attendance of the courses that have it. Add a word for every class of one course: <code>/attendance operating</code>\n"
     "/exams — midterm and final weeks (with dates, weight and countdown), from the syllabi. Add a word to filter: <code>/exams database</code>\n"
