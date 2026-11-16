@@ -740,7 +740,8 @@ def undated_line(row):
 
 def res_line(row):
     uid, title, course, kind, url = row[:5]
-    name = f'<a href="{esc(url)}">{esc(title)}</a>' if url else esc(title)
+    # files and folders download via their button, so no eclass link; the rest can only be opened
+    name = f'<a href="{esc(url)}">{esc(title)}</a>' if url and kind not in DOWNLOADABLE else esc(title)
     return f"{RES_ICON.get(kind, '•')} {name}"
 
 
