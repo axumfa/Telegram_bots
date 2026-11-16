@@ -7,6 +7,7 @@ import os
 import re
 import sqlite3
 import time
+import unicodedata
 from email.message import Message as _EmailMessage
 from datetime import date, datetime, time as dtime, timedelta, timezone
 from urllib.parse import unquote, urljoin, urlparse
@@ -738,10 +739,17 @@ def undated_line(row):
     return f"{ICON['done'] if status == 'done' else ICON['na']} {name} · {esc(short_course(course))}"
 
 
+def download_command(uid, title):
+    """The title written as a tappable command, /Lecture_9_slides_123 (commands allow only a-z, 0-9, _ and 32 chars)."""
+    num = uid.rpartition("-")[2]
+    slug = re.sub(r"[^A-Za-z0-9]+", "_", unicodedata.normalize("NFKD", clean_title(title)).encode("ascii", "ignore").decode()).strip("_")
+    return f"/{slug[: 30 - len(num)].rstrip('_') or 'file'}_{num}"
+
+
 def res_line(row):
     uid, title, course, kind, url = row[:5]
-    if kind in DOWNLOADABLE:  # tapping the blue /dl_... command downloads it (Telegram sends it as a message)
-        return f"{RES_ICON.get(kind, '•')} {esc(title)}  /dl_{uid.replace('-', '_', 1)}"
+    if kind in DOWNLOADABLE:  # the title itself is a bot command: tapping it sends it, and the bot sends the file
+        return f"{RES_ICON.get(kind, '•')} {download_command(uid, title)}"
     name = f'<a href="{esc(url)}">{esc(title)}</a>' if url else esc(title)
     return f"{RES_ICON.get(kind, '•')} {name}"
 
@@ -1392,7 +1400,7 @@ MENU = [
     ("missed", "🕳 Deadlines that passed unsubmitted"),
     ("nodeadline", "♾ Work eclass gives no deadline for"),
     ("done", "✅ Mark handed in / mute (add a word to narrow)"),
-    ("resources", "📚 Course materials, tap a /dl_ link to download (add a word to filter)"),
+    ("resources", "📚 Course materials, tap a title to download (add a word to filter)"),
     ("grades", "📊 Your grades (add a course for details)"),
     ("attendance", "🗓 Offline attendance (add a course for details)"),
     ("exams", "🎓 Midterm and final weeks (add a course to filter)"),
@@ -1420,7 +1428,7 @@ HELP = (
     "/nodeadline — assignments and quizzes with no deadline on eclass (e.g. Gradescope work); new ones are announced silently\n"
     f"/missed — deadlines of the last {MISSED_DAYS} days that passed without a submission\n"
     "/resources — latest course materials (files, videos, links). "
-    "Tap the blue /dl_… link after a file or folder to get it here in Telegram. Add a word to filter: <code>/resources database</code>\n"
+    "Tap a file or folder title (blue) to get it here in Telegram. Add a word to filter: <code>/resources database</code>\n"
     "/grades — your course totals. Add a word for the details of one course: <code>/grades database</code>\n"
     "/attendance — offline attendance of the courses that have it. Add a word for every class of one course: <code>/attendance operating</code>\n"
     "/exams — midterm and final weeks (with dates, weight and countdown), from the syllabi. Add a word to filter: <code>/exams database</code>\n"
@@ -1451,9 +1459,11 @@ async def cmd_start(m: Message):
     await m.answer(HELP, reply_markup=KEYBOARD)
 
 
-@dp.message(Command(re.compile(r"dl_(\w+)")))
+@dp.message(Command(re.compile(r".*_(\d+)")))
 async def cmd_dl(m: Message, command: CommandObject):
-    await send_resource(command.regexp_match.group(1).replace("_", "-", 1), m.answer)
+    """A tapped file title (/Lecture_9_slides_123): the number at the end is the module id."""
+    row = db.execute("SELECT uid FROM resources WHERE uid LIKE ? AND kind IN ('ubfile','folder')", (f"%-{command.regexp_match.group(1)}",)).fetchone()
+    await send_resource(row[0] if row else "", m.answer)
 
 
 @dp.message(Command("upcoming"))

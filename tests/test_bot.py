@@ -1264,7 +1264,7 @@ async def test_download_button_sends_document(b, monkeypatch):
     b.db.execute("INSERT INTO resources VALUES('vod-2','Video',?, 'vod','https://e/v',0)", (COURSE,))
     rows = b.db.execute("SELECT uid,title,course,kind,url FROM resources").fetchall()
     text = b.render_resources(rows)
-    assert "/dl_ubfile_1" in text and "dl_vod" not in text  # videos can't be downloaded
+    assert "/Lecture_1_1" in text and "Video</a>" in text  # videos can't be downloaded
     docs, notes = [], []
 
     async def fake_doc(chat, doc, caption=None):
