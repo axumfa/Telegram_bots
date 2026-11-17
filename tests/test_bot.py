@@ -1274,7 +1274,7 @@ async def test_download_button_sends_document(b, monkeypatch):
         notes.append(text)
 
     monkeypatch.setattr(b.bot, "send_document", fake_doc)
-    monkeypatch.setattr(b, "download_resource", lambda url: [("l1.pdf", b"x")])
+    monkeypatch.setattr(b, "download_resource", lambda url, pick=None: [("l1.pdf", b"x")])
     await b.send_resource("ubfile-1", answer)
     assert docs == [("l1.pdf", "Lecture 1")]
     await b.send_resource("nope", answer)
@@ -1285,7 +1285,7 @@ async def test_download_failure_tells_you_instead_of_crashing(b, monkeypatch):
     b.db.execute("DELETE FROM resources")
     b.db.execute("INSERT INTO resources VALUES('ubfile-1','Lecture 1',?, 'ubfile','https://e/m',0)", (COURSE,))
 
-    def boom(url):
+    def boom(url, pick=None):
         raise OSError("net down")
 
     monkeypatch.setattr(b, "download_resource", boom)
@@ -1305,3 +1305,56 @@ def test_every_handler_is_in_the_menu_and_on_the_keyboard(b):
     menu = {c for c, _ in b.MENU}
     assert handled == menu
     assert {k.text for row in b.KEYBOARD.keyboard for k in row} == {f"/{c}" for c in menu}
+
+
+def test_assignment_files_are_only_the_ones_the_teacher_attached():
+    import bot
+
+    page = (
+        '<a href="/pluginfile.php/1/mod_assign/introattachment/0/hw1.pdf?forcedownload=1">hw1</a>'
+        '<a href="/pluginfile.php/1/assignsubmission_file/submission_files/9/mine.docx">mine</a>'
+        '<a href="/pluginfile.php/1/assignfeedback_file/feedback_files/9/fb.pdf">fb</a>'
+    )
+    assert bot.assignment_files(page, "https://e/mod/assign/view.php?id=1") == [
+        "https://e/pluginfile.php/1/mod_assign/introattachment/0/hw1.pdf?forcedownload=1"
+    ]
+    assert len(bot.assignment_files(fixture("assign_ungraded.html"), "https://e/")) == 2
+    assert bot.assignment_files(fixture("assign_graded.html"), "https://e/") == []
+
+
+def test_assignment_line_shows_files_command_only_when_it_has_files(b):
+    ts = int(time.time()) + 3600
+    row = ("assign-69749", "Homework 1", COURSE, ts, "https://e/a", "todo")
+    assert "/files_69749" in b.line((*row, 2))
+    assert "/files_" not in b.line((*row, 0)) and "/files_" not in b.line(row)
+    assert "/files_7" in b.undated_line(("HW", COURSE, "u", "todo", 1, "assign-7"))
+    assert "/files_" not in b.undated_line(("HW", COURSE, "u", "todo", 0, "assign-7"))
+
+
+async def test_files_command_sends_assignment_attachments(b, monkeypatch):
+    b.db.execute("DELETE FROM events")
+    b.db.execute("INSERT INTO events(uid,title,course,start_ts,url,kind,status,files) VALUES('assign-5','HW 5',?,1,'https://e/a','assign','todo',2)", (COURSE,))
+    docs, picks = [], []
+
+    async def fake_doc(chat, doc, caption=None):
+        docs.append(doc.filename)
+
+    async def answer(text):
+        pass
+
+    def fake_download(url, pick=None):
+        picks.append(pick)
+        return [("hw.pdf", b"x"), ("starter.zip", b"y")]
+
+    monkeypatch.setattr(b.bot, "send_document", fake_doc)
+    monkeypatch.setattr(b, "download_resource", fake_download)
+    await b.send_resource("assign-5", answer)
+    assert docs == ["hw.pdf", "starter.zip"] and picks == [b.assignment_files]
+    b.db.execute("UPDATE events SET files=0")
+    notes = []
+
+    async def note(text):
+        notes.append(text)
+
+    await b.send_resource("assign-5", note)
+    assert notes == ["That item is gone"]

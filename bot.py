@@ -89,7 +89,7 @@ log = logging.getLogger("eclass-bot")
 
 # your own "done" (for things handed in elsewhere) wins over what eclass shows; "mute" only silences reminders
 STATUS = "CASE WHEN override = 'done' THEN 'done' ELSE status END"
-COLS = f"uid,title,course,start_ts,url,{STATUS}"
+COLS = f"uid,title,course,start_ts,url,{STATUS},COALESCE(files,0)"
 
 db = sqlite3.connect(os.getenv("DB_PATH", "eclass.db"))
 db.executescript(
@@ -110,6 +110,12 @@ db.executescript(
 for col in ("url", "kind", "status", "override"):  # added later; migrate old databases
     try:
         db.execute(f"ALTER TABLE events ADD COLUMN {col} TEXT")
+    except sqlite3.OperationalError:
+        pass
+
+for table in ("events", "undated"):  # number of files the teacher attached to the assignment
+    try:
+        db.execute(f"ALTER TABLE {table} ADD COLUMN files INTEGER")
     except sqlite3.OperationalError:
         pass
 
@@ -158,12 +164,14 @@ def clean_title(title):
 
 
 def line(row, date=True):
-    uid, title, course, ts, url, status = row
+    uid, title, course, ts, url, status, *rest = row
     name = esc(clean_title(title))
     if url:
         name = f'<a href="{esc(url)}">{name}</a>'
     tag = short_course(course)
     parts = [f"{ICON.get(status, '•')} {name}"]
+    if rest and rest[0]:
+        parts[0] += f" 📎 {files_command(uid)}"
     if tag:
         parts.append(esc(tag))
     parts += [fmt_ts(ts, date), left(ts)]
@@ -247,6 +255,11 @@ def parse_status(kind, page):
     return "?"
 
 
+def assignment_files(page, base):
+    """Files the teacher attached to an assignment (not the ones you submitted or got back as feedback), in order."""
+    return [h for h in file_links(page, base) if "/mod_assign/intro" in h]
+
+
 def parse_due(kind, page):
     """Deadline (unix ts) from an assignment or quiz view page, or None."""
     soup = BeautifulSoup(page, "html.parser")
@@ -297,7 +310,7 @@ def course_activities(cid, fallback_name):
 
 
 def scrape_courses(known):
-    """known: {uid: (start_ts, status)} -> ([(uid, title, course, ts, url, kind, status)], [(uid, title, course, kind, url)]).
+    """known: {uid: (start_ts, status)} -> ([(uid, title, course, ts, url, kind, status, attached files)], [(uid, title, course, kind, url)]).
 
     An item that never had a deadline (Gradescope tasks, results placeholders) comes back with ts None.
 
@@ -324,7 +337,8 @@ def scrape_courses(known):
                 page = web_get(url).text
                 ts = parse_due(kind, page)
                 if ts is not None or uid not in known:  # a known item whose page lost its date is probably a glitch
-                    out.append((uid, title, course, ts, url, kind, parse_status(kind, page)))
+                    nfiles = len(assignment_files(page, url)) if kind == "assign" else 0
+                    out.append((uid, title, course, ts, url, kind, parse_status(kind, page), nfiles))
             except Exception as e:
                 log.warning("%s failed: %s", uid, e)
     return out, resources
@@ -693,25 +707,26 @@ async def sync_events():
     now = datetime.now(timezone.utc).timestamp()
     first_undated = not db.execute("SELECT 1 FROM kv WHERE key='undated_seen'").fetchone()
     new_undated = []
-    for uid, title, course, ts, url, kind, status in found:
+    for uid, title, course, ts, url, kind, status, *rest in found:
+        nfiles = rest[0] if rest else 0
         if ts is None:  # no deadline on eclass: listed by /nodeadline, never reminded about
             if not db.execute("SELECT 1 FROM undated WHERE uid=?", (uid,)).fetchone():
-                db.execute("INSERT INTO undated VALUES(?,?,?,?,?,?,?)", (uid, title, course, kind, url, status, int(now)))
-                new_undated.append((uid, title, course, url, status))
+                db.execute("INSERT INTO undated(uid,title,course,kind,url,status,first_seen,files) VALUES(?,?,?,?,?,?,?,?)", (uid, title, course, kind, url, status, int(now), nfiles))
+                new_undated.append((uid, title, course, url, status, nfiles))
             else:
-                db.execute("UPDATE undated SET title=?, course=?, url=?, status=? WHERE uid=?", (title, course, url, status, uid))
+                db.execute("UPDATE undated SET title=?, course=?, url=?, status=?, files=? WHERE uid=?", (title, course, url, status, nfiles, uid))
             continue
         db.execute("DELETE FROM undated WHERE uid=?", (uid,))  # it got a deadline after all
         old = known.get(uid)
         db.execute(
-            "INSERT INTO events(uid,title,course,start_ts,url,kind,status) VALUES(?,?,?,?,?,?,?) "
+            "INSERT INTO events(uid,title,course,start_ts,url,kind,status,files) VALUES(?,?,?,?,?,?,?,?) "
             "ON CONFLICT(uid) DO UPDATE SET title=excluded.title, course=excluded.course, "
-            "start_ts=excluded.start_ts, url=excluded.url, kind=excluded.kind, status=excluded.status",
-            (uid, title, course, ts, url, kind, status),
+            "start_ts=excluded.start_ts, url=excluded.url, kind=excluded.kind, status=excluded.status, files=excluded.files",
+            (uid, title, course, ts, url, kind, status, nfiles),
         )
         if first_run or ts < now:
             continue
-        row = (uid, title, course, ts, url, status)
+        row = (uid, title, course, ts, url, status, nfiles)
         if old is None:
             far = ts - now > SILENT_BEYOND_DAYS * 86400
             await bot.send_message(CHAT_ID, "🆕 " + line(row), disable_notification=far)
@@ -721,7 +736,7 @@ async def sync_events():
     db.execute("INSERT OR IGNORE INTO kv VALUES('undated_seen','1')")
     if new_undated and not first_undated:
         await bot.send_message(
-            CHAT_ID, "📌 <b>No deadline on eclass</b>\n" + "\n".join(undated_line(r[1:]) for r in new_undated), disable_notification=True
+            CHAT_ID, "📌 <b>No deadline on eclass</b>\n" + "\n".join(undated_line((*r[1:6], r[0])) for r in new_undated), disable_notification=True
         )
     new_res = []
     for row in resources:
@@ -734,9 +749,10 @@ async def sync_events():
 
 
 def undated_line(row):
-    title, course, url, status = row
+    title, course, url, status, *rest = row
     name = f'<a href="{esc(url)}">{esc(clean_title(title))}</a>' if url else esc(clean_title(title))
-    return f"{ICON['done'] if status == 'done' else ICON['na']} {name} · {esc(short_course(course))}"
+    out = f"{ICON['done'] if status == 'done' else ICON['na']} {name} · {esc(short_course(course))}"
+    return out + (f" 📎 {files_command(rest[1])}" if len(rest) > 1 and rest[0] else "")
 
 
 def download_command(uid, title):
@@ -744,6 +760,11 @@ def download_command(uid, title):
     num = uid.rpartition("-")[2]
     slug = re.sub(r"[^A-Za-z0-9]+", "_", unicodedata.normalize("NFKD", clean_title(title)).encode("ascii", "ignore").decode()).strip("_")
     return f"/{slug[: 30 - len(num)].rstrip('_') or 'file'}_{num}"
+
+
+def files_command(uid):
+    """/files_69749: tapping it sends the files attached to that assignment."""
+    return f"/files_{uid.rpartition('-')[2]}"
 
 
 def res_line(row):
@@ -823,8 +844,8 @@ def file_links(page, base):
     return out
 
 
-def download_resource(url):
-    """[(name, bytes)] for an eclass file or folder page. Blocking.
+def download_resource(url, pick=file_links):
+    """[(name, bytes)] for an eclass file or folder page (or, with pick=assignment_files, an assignment's attachments). Blocking.
 
     The module link either serves the file itself or shows a page that links to it.
     """
@@ -835,7 +856,7 @@ def download_resource(url):
     if "text/html" not in r.headers.get("content-type", ""):
         return [_read_file(r)]
     page, base = r.text, r.url
-    links = file_links(page, base)
+    links = pick(page, base)
     if not links:
         raise ValueError("no file found on that page: open it on eclass")
     files = []
@@ -853,14 +874,21 @@ def download_resource(url):
 async def send_resource(uid, answer):
     """Fetch resource uid from eclass and send it to the chat. answer(text) shows progress or a failure."""
     row = db.execute("SELECT title,url,kind FROM resources WHERE uid=?", (uid,)).fetchone()
-    if not row or row[2] not in DOWNLOADABLE:
+    pick = file_links
+    if not row:  # an assignment with files attached by the teacher
+        row = db.execute("SELECT title,url,kind FROM events WHERE uid=? AND files > 0 UNION "
+                         "SELECT title,url,kind FROM undated WHERE uid=? AND files > 0", (uid, uid)).fetchone()
+        pick = assignment_files
+    elif row[2] not in DOWNLOADABLE:
+        row = None
+    if not row:
         await answer("That item is gone")
         return
     title, url, _ = row
     log.info("download %s requested", uid)
     await answer("Downloading…")
     try:
-        files = await asyncio.to_thread(download_resource, url)
+        files = await asyncio.to_thread(download_resource, url, pick)
     except ValueError as e:
         await bot.send_message(CHAT_ID, f"⚠️ {esc(title)}: {esc(str(e))}")
         return
@@ -1461,8 +1489,13 @@ async def cmd_start(m: Message):
 
 @dp.message(Command(re.compile(r".*_(\d+)")))
 async def cmd_dl(m: Message, command: CommandObject):
-    """A tapped file title (/Lecture_9_slides_123): the number at the end is the module id."""
-    row = db.execute("SELECT uid FROM resources WHERE uid LIKE ? AND kind IN ('ubfile','folder')", (f"%-{command.regexp_match.group(1)}",)).fetchone()
+    """A tapped file title (/Lecture_9_slides_123) or assignment's /files_123: the number at the end is the module id."""
+    uid = f"%-{command.regexp_match.group(1)}"
+    row = (
+        db.execute("SELECT uid FROM resources WHERE uid LIKE ? AND kind IN ('ubfile','folder')", (uid,)).fetchone()
+        or db.execute("SELECT uid FROM events WHERE uid LIKE ? AND files > 0", (uid,)).fetchone()
+        or db.execute("SELECT uid FROM undated WHERE uid LIKE ? AND files > 0", (uid,)).fetchone()
+    )
     await send_resource(row[0] if row else "", m.answer)
 
 
@@ -1517,7 +1550,7 @@ async def on_action(q: CallbackQuery):
 @dp.message(Command("nodeadline"))
 async def cmd_nodeadline(m: Message):
     """Assignments and quizzes eclass gives no deadline for (e.g. work submitted on Gradescope)."""
-    rows = db.execute("SELECT title,course,url,status FROM undated ORDER BY (status = 'done'), course, title").fetchall()
+    rows = db.execute("SELECT title,course,url,status,COALESCE(files,0),uid FROM undated ORDER BY (status = 'done'), course, title").fetchall()
     await m.answer(
         "<b>No deadline on eclass</b>\n" + "\n".join(undated_line(r) for r in rows)
         if rows
