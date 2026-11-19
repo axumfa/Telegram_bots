@@ -1358,3 +1358,17 @@ async def test_files_command_sends_assignment_attachments(b, monkeypatch):
 
     await b.send_resource("assign-5", note)
     assert notes == ["That item is gone"]
+
+
+def test_search_resources(b):
+    C = "The New History of Uzbekistan[001]"
+    rows = [(f"{k}-{i}", t, C, k, "u") for i, (k, t) in enumerate([
+        ("vod", "Lecture 13_Part 1"), ("ubfile", "Lecture 13"), ("vod", "Lecture 3_Part 1"),
+        ("ubfile", "Lecture 3"), ("ubfile", "Lecture 3"), ("ubfile", "Lecture 10")], start=100)]
+    titles = lambda q: [r[1] for r in b.search_resources(rows, q)[0]]
+    assert titles("history lecture 3") == ["Lecture 3_Part 1", "Lecture 3", "Lecture 3"]  # not 13; lecture order
+    assert titles("uzbekistan files") == ["Lecture 3", "Lecture 3", "Lecture 10", "Lecture 13"]
+    assert titles("video 13") == ["Lecture 13_Part 1"]
+    assert titles("LECTURE 99") == []
+    shown, total = b.search_resources(rows * 10, "")
+    assert len(shown) == b.RES_LIMIT and total == 60

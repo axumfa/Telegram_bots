@@ -1428,7 +1428,7 @@ MENU = [
     ("missed", "🕳 Deadlines that passed unsubmitted"),
     ("nodeadline", "♾ Work eclass gives no deadline for"),
     ("done", "✅ Mark handed in / mute (add a word to narrow)"),
-    ("resources", "📚 Course materials, tap a title to download (add a word to filter)"),
+    ("resources", "📚 Course materials, tap a title to download (add words to filter)"),
     ("grades", "📊 Your grades (add a course for details)"),
     ("attendance", "🗓 Offline attendance (add a course for details)"),
     ("exams", "🎓 Midterm and final weeks (add a course to filter)"),
@@ -1456,7 +1456,7 @@ HELP = (
     "/nodeadline — assignments and quizzes with no deadline on eclass (e.g. Gradescope work); new ones are announced silently\n"
     f"/missed — deadlines of the last {MISSED_DAYS} days that passed without a submission\n"
     "/resources — latest course materials (files, videos, links). "
-    "Tap a file or folder title (blue) to get it here in Telegram. Add a word to filter: <code>/resources database</code>\n"
+    "Tap a file or folder title (blue) to get it here in Telegram. Narrow it with words and a type: <code>/resources history lecture 3</code>, <code>/resources database video</code>, <code>/resources operating files</code>\n"
     "/grades — your course totals. Add a word for the details of one course: <code>/grades database</code>\n"
     "/attendance — offline attendance of the courses that have it. Add a word for every class of one course: <code>/attendance operating</code>\n"
     "/exams — midterm and final weeks (with dates, weight and countdown), from the syllabi. Add a word to filter: <code>/exams database</code>\n"
@@ -1588,17 +1588,66 @@ async def cmd_inbox(m: Message, command: CommandObject):
     await m.answer(render_inbox(rows) if rows else ("Nothing matches that" if command.args else "No messages yet — try /sync first"))
 
 
+RES_KIND_WORDS = {"video": ("vod",), "videos": ("vod",), "vod": ("vod",), "file": ("ubfile",), "files": ("ubfile",),
+                  "notes": ("ubfile",), "slides": ("ubfile",), "folder": ("folder",), "folders": ("folder",),
+                  "link": ("url",), "links": ("url",), "page": ("page",), "pages": ("page",)}
+RES_LIMIT, RES_LIMIT_FILTERED = 15, 40
+
+
+def search_resources(rows, query):
+    """rows (uid,title,course,kind,url, newest first) -> (matches, total).
+
+    Every word must match (AND). A kind word (video, file, folder, link, page) filters by type.
+    A number matches a whole number in the title, so '3' finds 'Lecture 3' but not 'Lecture 13'.
+    Any other word is a case-insensitive substring of the title or course. No query: the newest few.
+    """
+    words = query.lower().split()
+    kinds, terms = set(), []
+    for w in words:
+        if w in RES_KIND_WORDS:
+            kinds.update(RES_KIND_WORDS[w])
+        else:
+            terms.append(w)
+    if not words:
+        return rows[:RES_LIMIT], len(rows)
+
+    def ok(r):
+        title, course = (r[1] or "").lower(), (r[2] or "").lower()
+        if kinds and r[3] not in kinds:
+            return False
+        for t in terms:
+            if t.isdigit():
+                if not re.search(rf"(?<!\d){t}(?!\d)", title):
+                    return False
+            elif t not in title and t not in course:
+                return False
+        return True
+
+    hits = [r for r in rows if ok(r)]
+
+    def order(r):  # by course, then the number in the title (Lecture 2 before Lecture 10), then eclass order
+        num = re.search(r"\d+", r[1] or "")
+        return (r[2], int(num.group()) if num else 10**6, int(r[0].rpartition("-")[2]))
+
+    return sorted(hits, key=order)[:RES_LIMIT_FILTERED], len(hits)
+
+
 @dp.message(Command("resources"))
 async def cmd_resources(m: Message, command: CommandObject):
-    """Latest course materials (no submission needed); '/resources database' filters by course or title."""
-    q, args = "SELECT uid,title,course,kind,url FROM resources", []
-    if command.args:
-        q += " WHERE course LIKE ? ESCAPE '\\' OR title LIKE ? ESCAPE '\\'"
-        args = [like(command.args)] * 2
+    """Latest course materials; '/resources history lecture 3', '/resources operating video' narrow them by words and type."""
     # module ids grow over time, so a bigger id means added later
-    rows = db.execute(q + " ORDER BY first_seen DESC, CAST(substr(uid, instr(uid,'-')+1) AS INTEGER) DESC LIMIT 15", args).fetchall()
-    rows.sort(key=lambda r: r[2])  # group by course (stable, keeps newest-first inside each)
-    await m.answer(render_resources(rows) if rows else "No materials found")
+    rows = db.execute("SELECT uid,title,course,kind,url FROM resources "
+                      "ORDER BY first_seen DESC, CAST(substr(uid, instr(uid,'-')+1) AS INTEGER) DESC").fetchall()
+    shown, total = search_resources(rows, command.args or "")
+    if not command.args:
+        shown.sort(key=lambda r: r[2])  # group by course (stable, keeps newest-first inside each)
+    if not shown:
+        await m.answer("No materials found")
+        return
+    text = render_resources(shown)
+    if total > len(shown):
+        text += f"\n\n…and {total - len(shown)} more: add a word or a type (video, file) to narrow it"
+    await m.answer(text)
 
 
 @dp.message(Command("grades"))
